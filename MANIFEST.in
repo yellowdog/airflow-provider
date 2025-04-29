@@ -1,0 +1,5 @@
+# Exclude files and directories from the build
+prune docs
+prune tests
+prune yellowdog_provider/example_dags
+exclude README.md

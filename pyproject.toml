@@ -1,0 +1,43 @@
+[build-system]
+    requires = ["setuptools", "wheel"]
+    build-backend = "setuptools.build_meta"
+
+[project]
+    name = "yellowdog-airflow-provider"
+    description = "YellowDog Provider for Apache Airflow."
+    classifiers = [
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Operating System :: OS Independent",
+        "Development Status :: 4 - Beta",
+        "Framework :: Apache Airflow",
+        "Framework :: Apache Airflow :: Provider",
+    ]
+    requires-python = ">= 3.10, < 3.13"
+    dynamic = ["dependencies", "version"]
+    license = "Apache-2.0"
+
+[[project.authors]]
+    name = "YellowDog Limited"
+    email = "support@yellowdog.co"
+
+[project.urls]
+    Homepage = "https://github.com/yellowdog/airflow-provider"
+    Source = "https://github.com/yellowdog/airflow-provider"
+
+[project.readme]
+    file = "PYPI_README.md"
+    content-type = "text/markdown"
+
+[project.entry-points.apache_airflow_provider]
+    provider_info = "yellowdog_provider.__init__:get_provider_info"
+
+[tool.setuptools.dynamic.dependencies]
+    file = ["requirements.txt"]
+
+[tool.setuptools]
+    include-package-data = true
+
+[tool.setuptools.dynamic.version]
+    attr = "yellowdog_provider.__version__"

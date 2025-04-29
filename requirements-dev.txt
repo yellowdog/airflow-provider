@@ -1,0 +1,11 @@
+black
+build
+isort
+pytest
+pyupgrade
+requests-mock
+setuptools
+sphinx
+sphinx-rtd-theme
+twine
+wheel

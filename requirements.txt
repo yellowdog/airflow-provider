@@ -1,0 +1,2 @@
+apache-airflow >= 2.7.0
+yellowdog-sdk >= 9.1.4
