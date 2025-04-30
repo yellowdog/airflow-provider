@@ -2,7 +2,7 @@
 
 SRC = yellowdog_provider/*.py yellowdog_provider/*/*.py docs/*.py
 TESTS = tests/*.py tests/*/*.py
-BUILD_DIST = build dist airflow_provider_yellowdog.egg-info
+BUILD_DIST = build dist yellowdog_airflow_provider.egg-info
 PYCACHE = __pycache__
 
 VERSION_FILE := yellowdog_provider/__init__.py
