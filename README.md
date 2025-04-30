@@ -10,6 +10,10 @@ The YellowDog Provider for Apache Airflow provides:
 
 The main documentation is found at: https://docs.yellowdog.ai/airflow-provider/index.html
 
+## Requirements
+
+Requires Apache Airflow v2.10.0 or later, Python 3.10 or later, and the [YellowDog SDK](https://pypi.org/project/yellowdog-sdk).
+
 ## Installation
 
 Install from PyPI as package `yellowdog-airflow-provider`, e.g.:

@@ -10,6 +10,8 @@ Welcome to the documentation for the YellowDog Provider for Apache Airflow. This
 
 The YellowDog Airflow Provider depends on the `YellowDog Python SDK <https://pypi.org/project/yellowdog-sdk>`_, and the provider's usage model leverages several Python classes from the SDK.
 
+The provider requires Apache Airflow v2.10 or later, and Python 3.10 or later.
+
 Contents
 ========
 
