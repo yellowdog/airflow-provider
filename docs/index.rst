@@ -124,7 +124,7 @@ Templating
 
 Most of the arguments passed to the YellowDog operators and sensors are templated, meaning that Airflow jinja templating can be used. Arguments of type ``str`` can be templated in situ; arguments of more complex types (e.g., a ``WorkRequirement`` object) must use the callable mechanism below to effect templating.
 
-Any templated argument can be supplied with a callable function instead of a direct value. Supplying a ``Callable`` as the argument allows for complex objects arguments to be generated, or for more complicated processing to be invoked. If a ``Callable`` is supplied as the argument, the callable function must return an object of the required type, and it it must accept two named arguments as follows::
+Any templated argument can be supplied with a callable function instead of a direct value. Supplying a ``Callable`` as the argument allows for complex object arguments to be generated, or for more complicated processing to be invoked. If a ``Callable`` is supplied as the argument, the callable function must return an object of the required type, and it it must accept two named arguments as follows::
 
     def my_callable(context: Context, jinja_env: Environment)
 
