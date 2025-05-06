@@ -22,7 +22,7 @@ docker run --rm -it -p 8080:8080 \
     -v "$(pwd)":/opt/airflow/airflow-provider-yellowdog \
     --name airflow-provider-yellowdog \
     --entrypoint=/bin/bash \
-    apache/airflow:latest-python3.12 \
+    apache/airflow:slim-latest-python3.12 \
     -c "cp -r /opt/airflow/airflow-provider-yellowdog /tmp && \
         pip install -U /tmp/airflow-provider-yellowdog && \
         pip install apache-airflow-providers-fab && \
