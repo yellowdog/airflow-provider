@@ -33,7 +33,7 @@ pyupgrade: $(SRC)
 format: pyupgrade isort black
 
 update:
-	pip install -U pip -r requirements.txt -r requirements-dev.txt
+	pip install -U -r requirements.txt -r requirements-dev.txt
 
 .PHONY: docs
 
