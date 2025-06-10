@@ -46,7 +46,7 @@ docs-build-image: docs
 docs-publish-image: docs-build-image
 	docker push yellowdogco/airflow-provider-docs:$(VERSION)
 
-# See the ~.pypirc file for the repository index
+# See the ~/.pypirc file for the repository index
 pypi-check-build: clean build
 	twine check dist/*
 
