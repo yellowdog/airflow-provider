@@ -63,7 +63,7 @@ Here, the ``host`` property is used to set the platform API URL, ``login`` is us
 Using a YellowDog Connection
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-When the ``get_conn()`` method of a `YellowDogHook` object is called, it returns a YellowDog ``PlatformClient`` object that is used to identify the Platform API URL and to authenticate API calls. The ``PlatformClient`` object is used internally within the YellowDog provider classes, and can also be used directly within user code to utilise the full capabilities of the YellowDog SDK.
+When the ``get_conn()`` method of a ``YellowDogHook`` object is called, it returns a YellowDog ``PlatformClient`` object that is used to identify the Platform API URL and to authenticate API calls. The ``PlatformClient`` object is used internally within the YellowDog provider classes, and can also be used directly within user code to utilise the full capabilities of the YellowDog SDK.
 
 The YellowDog Airflow Operators
 -------------------------------
