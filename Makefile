@@ -2,17 +2,22 @@
 
 SRC = yellowdog_provider/*.py yellowdog_provider/*/*.py docs/*.py
 TESTS = tests/*.py tests/*/*.py
+STUBS = yellowdog_provider/exceptions/*.pyi yellowdog_provider/hooks/*.pyi yellowdog_provider/operators/*.pyi yellowdog_provider/sensors/*.pyi yellowdog_provider/utils/*.pyi
 BUILD_DIST = build dist yellowdog_airflow_provider.egg-info
 PYCACHE = __pycache__
 
 VERSION_FILE := yellowdog_provider/__init__.py
 VERSION := $(shell grep "__version__ =" $(VERSION_FILE) | sed -E 's/.*"([^"]+)".*/\1/')
 
-build: $(SRC)
+build: $(SRC) stubs
 	python -m build
 
+stubs: $(SRC)
+	rm -f $(STUBS)
+	stubgen -o . yellowdog_provider/exceptions yellowdog_provider/hooks yellowdog_provider/operators yellowdog_provider/sensors yellowdog_provider/utils
+
 clean:
-	rm -rf $(BUILD_DIST) $(PYCACHE)
+	rm -rf $(BUILD_DIST) $(PYCACHE) $(STUBS)
 	$(MAKE) -C docs clean
 
 install: build
@@ -58,5 +63,5 @@ pypi-prod-upload: clean build
 
 no_op:
 	# Available targets are: build, clean, install, uninstall, format, update, docs,
-	# docs-build-image, docs-publish-image, pypi-check-build,
+	# docs-build-image, docs-publish-image, pypi-check-build, stubs
 	# pypi-test-upload, pypi-prod-upload

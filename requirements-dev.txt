@@ -1,6 +1,7 @@
 black
 build
 isort
+mypy
 pytest
 pyupgrade
 requests-mock
