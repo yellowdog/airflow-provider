@@ -35,7 +35,7 @@ The script [start-airflow-container.sh](bin/start-airflow-container.sh) will sta
 Run this script from the top-level repo. directory, i.e.:
 
 ```commandline
-bin/start-airflow-command.sh
+bin/start-airflow-container.sh
 ```
 
 Please inspect the script for instructions on its customisation and use.
