@@ -1,4 +1,4 @@
-FROM yellowdogco/static-site-server:1.6.0-58
+FROM yellowdogco/static-site-server:1.6.1-62
 
 COPY _build/html /static
 
