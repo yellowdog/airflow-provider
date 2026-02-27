@@ -9,7 +9,7 @@
 
 @font-face {
   font-family: "Inter";
-  src: url("/_static/inter-normal-variable.woff2") format("woff2-variations");
+  src: url("./inter-normal-variable.woff2") format("woff2-variations");
   font-weight: 100 900;
   font-stretch: 75% 125%;
   font-style: normal;
@@ -18,7 +18,7 @@
 
 @font-face {
   font-family: "Inter";
-  src: url("/_static/inter-italic-variable.woff2") format("woff2-variations");
+  src: url("./inter-italic-variable.woff2") format("woff2-variations");
   font-weight: 100 900;
   font-style: italic;
   font-display: swap;
