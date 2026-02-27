@@ -1,0 +1,90 @@
+:root {
+  --yd-yellow-500: #fab842;
+  --yd-grey-100: #e9ebec;
+  --yd-grey-800: #33383d;
+  --yd-grey-900: #23262a;
+  --yd-blue-500: #0a59ad;
+  --docs-bar-height: 1.75rem;
+}
+
+@font-face {
+  font-family: "Inter";
+  src: url("/_static/inter-normal-variable.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-stretch: 75% 125%;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Inter";
+  src: url("/_static/inter-italic-variable.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: swap;
+}
+
+body,
+.rst-content .toctree-wrapper > p.caption,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+legend .wy-side-nav-search > div.switch-menus > div.language-switch select,
+.wy-side-nav-search > div.switch-menus > div.version-switch select,
+.rst-versions {
+  font-family:
+    Inter,
+    Lato,
+    proxima-nova,
+    Helvetica Neue,
+    Arial,
+    sans-serif;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: 700;
+}
+
+.wy-nav-content-wrap {
+  background-color: var(--yd-grey-100);
+}
+
+.wy-nav-top {
+  background-color: var(--yd-yellow-500);
+  color: var(--yd-grey-900);
+
+  a {
+    color: var(--yd-grey-900);
+  }
+}
+
+.wy-nav-side {
+  background-color: var(--yd-grey-900);
+}
+
+.wy-grid-for-nav,
+.wy-nav-side {
+  height: calc(100% - var(--docs-bar-height));
+  top: var(--docs-bar-height);
+}
+
+.wy-side-nav-search {
+  background-color: var(--yd-yellow-500);
+}
+
+.wy-side-nav-search .wy-dropdown > a,
+.wy-side-nav-search > a {
+  color: var(--yd-grey-900);
+}
+
+a {
+  color: var(--yd-blue-500);
+}
