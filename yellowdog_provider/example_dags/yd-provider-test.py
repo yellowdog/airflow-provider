@@ -45,10 +45,19 @@ DAG_ID = "yellowdog-provider-test"
 from datetime import timedelta
 from re import sub
 
-from airflow.decorators import dag
-from airflow.models import BaseOperator, TaskInstance
-from airflow.utils.context import Context
-from airflow.utils.trigger_rule import TriggerRule
+try:
+    from airflow.sdk import dag
+    from airflow.sdk.definitions.context import Context
+    from airflow.task.trigger_rule import TriggerRule
+except ImportError:
+    from airflow.decorators import dag  # type: ignore[no-redef]
+    from airflow.utils.context import Context  # type: ignore[no-redef]
+    from airflow.utils.trigger_rule import TriggerRule  # type: ignore[no-redef]
+try:
+    from airflow.sdk.types import TaskInstance
+except ImportError:
+    from airflow.models import TaskInstance  # type: ignore[no-redef]
+from airflow.models import BaseOperator
 from jinja2 import Environment
 from yellowdog_client.common import SearchClient
 from yellowdog_client.model import (
