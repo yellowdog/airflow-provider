@@ -2,14 +2,21 @@
 YellowDog Airflow Operators for managing work requirements and worker pools.
 """
 
-from collections.abc import Callable, Sequence
+from __future__ import annotations
 
-try:
+from collections.abc import Callable, Collection
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
     from airflow.sdk.bases.operator import BaseOperator
     from airflow.sdk.definitions.context import Context
-except ImportError:
-    from airflow.models import BaseOperator  # type: ignore[no-redef]
-    from airflow.utils.context import Context  # type: ignore[no-redef]
+else:
+    try:
+        from airflow.sdk.bases.operator import BaseOperator
+        from airflow.sdk.definitions.context import Context
+    except ImportError:
+        from airflow.models import BaseOperator  # type: ignore[no-redef]
+        from airflow.utils.context import Context  # type: ignore[no-redef]
 from jinja2 import Environment
 from requests.exceptions import HTTPError
 from yellowdog_client import PlatformClient
@@ -21,6 +28,7 @@ from yellowdog_client.model import (
     Task,
     TaskGroup,
     WorkRequirement,
+    WorkRequirementStatus,
 )
 
 from yellowdog_provider.exceptions.yellowdog_exceptions import YellowDogException
@@ -40,7 +48,7 @@ class YellowDogOperator(BaseOperator):
     :type connection_id: str | Callable
     """
 
-    template_fields: Sequence[str] = ("connection_id",)
+    template_fields: Collection[str] = ("connection_id",)
 
     def __init__(
         self,
@@ -68,7 +76,7 @@ class AddWorkRequirement(YellowDogOperator):
     :rtype: str
     """
 
-    template_fields: Sequence[str] = (
+    template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
         "work_requirement",
     )
@@ -90,18 +98,15 @@ class AddWorkRequirement(YellowDogOperator):
         Adds the work requirement.
         """
 
-        client: PlatformClient = YellowDogHook(self.connection_id).get_conn()
+        client: PlatformClient = YellowDogHook(cast(str, self.connection_id)).get_conn()
+        wr = cast(WorkRequirement, self.work_requirement)
 
-        self.log.info(
-            f"Adding work requirement '{self.work_requirement.namespace}/"
-            f"{self.work_requirement.name}'"
-        )
-        self.work_requirement = client.work_client.add_work_requirement(
-            self.work_requirement
-        )
-        self.log.info(f"Added work requirement ID '{self.work_requirement.id}'")
+        self.log.info(f"Adding work requirement '{wr.namespace}/{wr.name}'")
+        wr = client.work_client.add_work_requirement(wr)
+        self.log.info(f"Added work requirement ID '{wr.id}'")
+        self.work_requirement = wr
 
-        return self.work_requirement.id
+        return cast(str, wr.id)
 
 
 class AddTaskGroupsToWorkRequirement(YellowDogOperator):
@@ -131,7 +136,7 @@ class AddTaskGroupsToWorkRequirement(YellowDogOperator):
     :rtype: list[str]
     """
 
-    template_fields: Sequence[str] = (
+    template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
         "work_requirement_id",
         "namespace",
@@ -164,29 +169,29 @@ class AddTaskGroupsToWorkRequirement(YellowDogOperator):
         Adds the task groups to the work requirement.
         """
 
-        client: PlatformClient = YellowDogHook(self.connection_id).get_conn()
+        client: PlatformClient = YellowDogHook(cast(str, self.connection_id)).get_conn()
 
         work_requirement = get_work_requirement_by_id_or_name(
             client,
             self.log,
-            self.work_requirement_id,
-            self.namespace,
-            self.work_requirement_name,
+            cast(str | None, self.work_requirement_id),
+            cast(str | None, self.namespace),
+            cast(str | None, self.work_requirement_name),
         )
+
+        task_groups = cast(list[TaskGroup], self.task_groups)
 
         if work_requirement.taskGroups is None:
-            work_requirement.taskGroups = self.task_groups
+            work_requirement.taskGroups = task_groups
         else:
-            work_requirement.taskGroups += self.task_groups
+            work_requirement.taskGroups += task_groups
 
-        self.log.info(
-            f"Adding {len(self.task_groups)} task group(s) to work requirement"
-        )
+        self.log.info(f"Adding {len(task_groups)} task group(s) to work requirement")
         work_requirement = client.work_client.update_work_requirement(work_requirement)
 
-        task_group_names = [task_group_.name for task_group_ in self.task_groups]
+        task_group_names = [task_group_.name for task_group_ in task_groups]
         added_task_group_ids = []
-        for task_group_ in work_requirement.taskGroups:
+        for task_group_ in work_requirement.taskGroups or []:
             if task_group_.name in task_group_names:
                 self.log.info(
                     f"Added task group '{task_group_.name}' ID '{task_group_.id}'"
@@ -228,7 +233,7 @@ class AddTasksToTaskGroup(YellowDogOperator):
     :rtype: list[str]
     """
 
-    template_fields: Sequence[str] = (
+    template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
         "namespace",
         "task_group_id",
@@ -262,42 +267,47 @@ class AddTasksToTaskGroup(YellowDogOperator):
         Adds the tasks to the task group.
         """
 
-        client: PlatformClient = YellowDogHook(self.connection_id).get_conn()
+        client: PlatformClient = YellowDogHook(cast(str, self.connection_id)).get_conn()
+        tasks = cast(list[Task], self.tasks)
+        task_group_id = cast(str | None, self.task_group_id)
+        namespace = cast(str | None, self.namespace)
+        work_requirement_name = cast(str | None, self.work_requirement_name)
+        task_group_name = cast(str | None, self.task_group_name)
 
-        if self.task_group_id is not None:
+        if task_group_id is not None:
             self.log.info(
-                f"Adding {len(self.tasks)} task(s) to task group ID '{self.task_group_id}'"
+                f"Adding {len(tasks)} task(s) to task group ID '{task_group_id}'"
             )
             added_tasks = client.work_client.add_tasks_to_task_group_by_id(
-                task_group_id=self.task_group_id,
-                tasks=self.tasks,
+                task_group_id=task_group_id,
+                tasks=tasks,
             )
 
         elif (
-            self.namespace is not None
-            and self.work_requirement_name is not None
-            and self.task_group_name is not None
+            namespace is not None
+            and work_requirement_name is not None
+            and task_group_name is not None
         ):
             self.log.info(
-                f"Adding {len(self.tasks)} task(s) to task group '{self.task_group_name}' in "
-                f"work requirement '{self.namespace}/{self.work_requirement_name}'"
+                f"Adding {len(tasks)} task(s) to task group '{task_group_name}' in "
+                f"work requirement '{namespace}/{work_requirement_name}'"
             )
             added_tasks = client.work_client.add_tasks_to_task_group_by_name(
-                self.namespace,
-                self.work_requirement_name,
-                self.task_group_name,
-                self.tasks,
+                namespace,
+                work_requirement_name,
+                task_group_name,
+                tasks,
             )
 
         else:
             raise YellowDogException(
-                f"Either 'task_group_id ({self.task_group_id})', "
-                f"or all of 'namespace' ({self.namespace}), "
-                f"'work_requirement_name' ({self.work_requirement_name}) and"
-                f"'task_group_name ({self.task_group_name})' must be supplied"
+                f"Either 'task_group_id ({task_group_id})', "
+                f"or all of 'namespace' ({namespace}), "
+                f"'work_requirement_name' ({work_requirement_name}) and"
+                f"'task_group_name ({task_group_name})' must be supplied"
             )
 
-        return [task_.id for task_ in added_tasks]
+        return [cast(str, task_.id) for task_ in added_tasks]
 
 
 class AddPopulatedWorkRequirement(YellowDogOperator):
@@ -322,7 +332,7 @@ class AddPopulatedWorkRequirement(YellowDogOperator):
     :rtype: str
     """
 
-    template_fields: Sequence[str] = (
+    template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
         "work_requirement",
         "task_groups_and_tasks",
@@ -350,42 +360,39 @@ class AddPopulatedWorkRequirement(YellowDogOperator):
         Adds the work requirement, task groups and tasks.
         """
 
-        client: PlatformClient = YellowDogHook(self.connection_id).get_conn()
+        client: PlatformClient = YellowDogHook(cast(str, self.connection_id)).get_conn()
+        wr = cast(WorkRequirement, self.work_requirement)
+        task_groups_and_tasks = cast(
+            list[tuple[TaskGroup, list[Task]]], self.task_groups_and_tasks
+        )
 
+        self.log.info(f"Adding work requirement '{wr.namespace}/{wr.name}'")
+        wr = client.work_client.add_work_requirement(wr)
+        self.log.info(f"Added work requirement ID '{wr.id}'")
+        self.work_requirement = wr
+
+        wr.taskGroups = [task_group for task_group, _ in task_groups_and_tasks]
         self.log.info(
-            f"Adding work requirement '{self.work_requirement.namespace}/"
-            f"{self.work_requirement.name}'"
-        )
-        self.work_requirement = client.work_client.add_work_requirement(
-            self.work_requirement
-        )
-        self.log.info(f"Added work requirement ID '{self.work_requirement.id}'")
-
-        self.work_requirement.taskGroups = [
-            task_group for task_group, _ in self.task_groups_and_tasks
-        ]
-        self.log.info(
-            f"Adding {len(self.work_requirement.taskGroups)} task group(s) to work requirement: "
-            f"{[task_group.name for task_group in self.work_requirement.taskGroups]}"
+            f"Adding {len(wr.taskGroups)} task group(s) to work requirement: "
+            f"{[task_group.name for task_group in wr.taskGroups]}"
         )
 
-        self.work_requirement.taskGroups.reverse()  # Maintain task group sequencing
-        self.work_requirement = client.work_client.update_work_requirement(
-            self.work_requirement
-        )
+        wr.taskGroups.reverse()  # Maintain task group sequencing
+        wr = client.work_client.update_work_requirement(wr)
+        self.work_requirement = wr
 
-        for task_group, tasks in self.task_groups_and_tasks:
+        for task_group, tasks in task_groups_and_tasks:
             self.log.info(
                 f"Adding {len(tasks)} task(s) to task group '{task_group.name}'"
             )
             client.work_client.add_tasks_to_task_group_by_name(
-                self.work_requirement.namespace,
-                self.work_requirement.name,
+                wr.namespace,
+                wr.name,
                 task_group.name,
                 tasks,
             )
 
-        return self.work_requirement.id
+        return cast(str, wr.id)
 
 
 class CancelWorkRequirement(YellowDogOperator):
@@ -414,7 +421,7 @@ class CancelWorkRequirement(YellowDogOperator):
     :rtype: str
     """
 
-    template_fields: Sequence[str] = (
+    template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
         "work_requirement_id",
         "namespace",
@@ -444,31 +451,31 @@ class CancelWorkRequirement(YellowDogOperator):
         Cancels the work requirement, optionally aborting running tasks.
         """
 
-        client: PlatformClient = YellowDogHook(self.connection_id).get_conn()
+        client: PlatformClient = YellowDogHook(cast(str, self.connection_id)).get_conn()
 
         work_requirement = get_work_requirement_by_id_or_name(
             client,
             self.log,
-            self.work_requirement_id,
-            self.namespace,
-            self.work_requirement_name,
+            cast(str | None, self.work_requirement_id),
+            cast(str | None, self.namespace),
+            cast(str | None, self.work_requirement_name),
         )
 
         self.log.info(f"Cancelling work requirement ID '{work_requirement.id}'")
         try:
             work_requirement = client.work_client.cancel_work_requirement_by_id(
-                work_requirement.id, self.abort_running_tasks
+                cast(str, work_requirement.id), self.abort_running_tasks
             )
         except HTTPError as e:  # Tolerate idempotent cancellations (YEL-13327)
             if "invalid transition" in str(e).lower():
                 self.log.warning(
                     "Cancellation invalid for work requirement with status "
-                    f"'{work_requirement.status.value}'"
+                    f"'{cast(WorkRequirementStatus, work_requirement.status).value}'"
                 )
             else:
                 raise e
 
-        return work_requirement.id
+        return cast(str, work_requirement.id)
 
 
 class ProvisionWorkerPool(YellowDogOperator):
@@ -491,7 +498,7 @@ class ProvisionWorkerPool(YellowDogOperator):
     :rtype: str
     """
 
-    template_fields: Sequence[str] = (
+    template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
         "compute_requirement_template_usage",
         "provisioned_worker_pool_properties",
@@ -521,21 +528,27 @@ class ProvisionWorkerPool(YellowDogOperator):
         Provisions the worker pool.
         """
 
-        client: PlatformClient = YellowDogHook(self.connection_id).get_conn()
+        client: PlatformClient = YellowDogHook(cast(str, self.connection_id)).get_conn()
+        crtu = cast(
+            ComputeRequirementTemplateUsage, self.compute_requirement_template_usage
+        )
+        pwpp = cast(
+            ProvisionedWorkerPoolProperties | None,
+            self.provisioned_worker_pool_properties,
+        )
 
         self.log.info(
             "Provisioning worker pool "
-            f"'{self.compute_requirement_template_usage.requirementNamespace}/"
-            f"{self.compute_requirement_template_usage.requirementName}'"
+            f"'{crtu.requirementNamespace}/{crtu.requirementName}'"
         )
 
         provisioned_worker_pool = client.worker_pool_client.provision_worker_pool(
-            self.compute_requirement_template_usage,
-            self.provisioned_worker_pool_properties,
+            crtu,
+            pwpp,
         )
         self.log.info(f"Provisioned worker pool ID '{provisioned_worker_pool.id}'")
 
-        return provisioned_worker_pool.id
+        return cast(str, provisioned_worker_pool.id)
 
 
 class ShutdownProvisionedWorkerPool(YellowDogOperator):
@@ -567,7 +580,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
     :rtype: str
     """
 
-    template_fields: Sequence[str] = (
+    template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
         "worker_pool_id",
         "namespace",
@@ -596,17 +609,23 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
         requirement.
         """
 
-        client: PlatformClient = YellowDogHook(self.connection_id).get_conn()
+        client: PlatformClient = YellowDogHook(cast(str, self.connection_id)).get_conn()
 
         worker_pool = get_worker_pool_by_id_or_name(
-            client, self.log, self.worker_pool_id, self.namespace, self.worker_pool_name
+            client,
+            self.log,
+            cast(str | None, self.worker_pool_id),
+            cast(str | None, self.namespace),
+            cast(str | None, self.worker_pool_name),
         )
 
         if isinstance(worker_pool, ProvisionedWorkerPool):
             self.log.info(
                 f"Shutting down provisioned worker pool ID '{worker_pool.id}'"
             )
-            client.worker_pool_client.shutdown_worker_pool_by_id(worker_pool.id)
+            client.worker_pool_client.shutdown_worker_pool_by_id(
+                cast(str, worker_pool.id)
+            )
             self.log.info(f"Shut down worker pool ID '{worker_pool.id}'")
 
             if self.terminate_immediately:
@@ -615,7 +634,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
                     f"'{worker_pool.computeRequirementId}'"
                 )
                 client.compute_client.terminate_compute_requirement_by_id(
-                    worker_pool.computeRequirementId
+                    cast(str, worker_pool.computeRequirementId)
                 )
 
             return worker_pool.id

@@ -2,7 +2,7 @@
 YellowDog utility functions.
 """
 
-from logging import Logger
+from typing import Any
 
 from yellowdog_client import PlatformClient
 from yellowdog_client.model import (
@@ -16,7 +16,7 @@ from yellowdog_provider.exceptions.yellowdog_exceptions import YellowDogExceptio
 
 def get_work_requirement_by_id_or_name(
     client: PlatformClient,
-    log: Logger,
+    log: Any,
     work_requirement_id: str | None,
     namespace: str | None,
     work_requirement_name: str | None,
@@ -58,7 +58,7 @@ def get_work_requirement_by_id_or_name(
 
 def get_worker_pool_by_id_or_name(
     client: PlatformClient,
-    log: Logger,
+    log: Any,
     worker_pool_id: str | None,
     namespace: str | None,
     worker_pool_name: str | None,
@@ -97,7 +97,7 @@ def get_worker_pool_by_id_or_name(
 
 def get_compute_requirement_by_id_or_name(
     client: PlatformClient,
-    log: Logger,
+    log: Any,
     compute_requirement_id: str | None,
     namespace: str | None,
     compute_requirement_name: str | None,

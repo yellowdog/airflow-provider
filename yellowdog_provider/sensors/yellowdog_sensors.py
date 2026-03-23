@@ -4,15 +4,22 @@ compute requirements. The sensors test for when one of a specified
 set of states is reached.
 """
 
-from collections.abc import Callable, Sequence
-from enum import Enum
+from __future__ import annotations
 
-try:
+from collections.abc import Callable, Collection
+from enum import Enum
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
     from airflow.sdk.bases.sensor import BaseSensorOperator
     from airflow.sdk.definitions.context import Context
-except ImportError:
-    from airflow.sensors.base import BaseSensorOperator  # type: ignore[no-redef]
-    from airflow.utils.context import Context  # type: ignore[no-redef]
+else:
+    try:
+        from airflow.sdk.bases.sensor import BaseSensorOperator
+        from airflow.sdk.definitions.context import Context
+    except ImportError:
+        from airflow.sensors.base import BaseSensorOperator  # type: ignore[no-redef]
+        from airflow.utils.context import Context  # type: ignore[no-redef]
 from jinja2 import Environment
 from yellowdog_client import PlatformClient
 from yellowdog_client.model import (
@@ -55,7 +62,7 @@ class YellowDogSensor(BaseSensorOperator):
     :type connection_id: str | Callable
     """
 
-    template_fields: Sequence[str] = ("connection_id",)
+    template_fields: Collection[str] = ("connection_id",)
 
     def __init__(
         self,
@@ -88,7 +95,7 @@ class YellowDogSensor(BaseSensorOperator):
 
         if not self.xcom_written:
             self.log.info(f"Writing {object_type.value} ID to XCom key '{XCOM_KEY}'")
-            context["task_instance"].xcom_push(key=XCOM_KEY, value=object_id)
+            context["task_instance"].xcom_push(key=XCOM_KEY, value=object_id)  # type: ignore[typeddict-item]
             self.xcom_written = True
 
         self.log.info(
@@ -137,7 +144,7 @@ class WorkRequirementStateSensor(YellowDogSensor):
     :type poke_interval: float
     """
 
-    template_fields: Sequence[str] = (
+    template_fields: Collection[str] = (
         *YellowDogSensor.template_fields,
         "work_requirement_id",
         "namespace",
@@ -174,21 +181,21 @@ class WorkRequirementStateSensor(YellowDogSensor):
         Tests the work requirement's status.
         """
 
-        client: PlatformClient = YellowDogHook(self.connection_id).get_conn()
+        client: PlatformClient = YellowDogHook(cast(str, self.connection_id)).get_conn()
 
         work_requirement: WorkRequirement = get_work_requirement_by_id_or_name(
             client,
             self.log,
-            self.work_requirement_id,
-            self.namespace,
-            self.work_requirement_name,
+            cast(str | None, self.work_requirement_id),
+            cast(str | None, self.namespace),
+            cast(str | None, self.work_requirement_name),
         )
 
         return self.check_status(
             context,
-            work_requirement.id,
+            cast(str, work_requirement.id),
             ObjectName.WORK_REQUIREMENT,
-            work_requirement.status,
+            cast(WorkRequirementStatus, work_requirement.status),
             self.target_states,
             self.target_states_names,
         )
@@ -222,7 +229,7 @@ class WorkerPoolStateSensor(YellowDogSensor):
     :type poke_interval: float
     """
 
-    template_fields: Sequence[str] = (
+    template_fields: Collection[str] = (
         *YellowDogSensor.template_fields,
         "worker_pool_id",
         "namespace",
@@ -257,14 +264,14 @@ class WorkerPoolStateSensor(YellowDogSensor):
         Tests the worker pool's status.
         """
 
-        client: PlatformClient = YellowDogHook(self.connection_id).get_conn()
+        client: PlatformClient = YellowDogHook(cast(str, self.connection_id)).get_conn()
 
         worker_pool: WorkerPool = get_worker_pool_by_id_or_name(
             client,
             self.log,
-            self.worker_pool_id,
-            self.namespace,
-            self.worker_pool_name,
+            cast(str | None, self.worker_pool_id),
+            cast(str | None, self.namespace),
+            cast(str | None, self.worker_pool_name),
         )
 
         # Keep the type system happy
@@ -273,9 +280,9 @@ class WorkerPoolStateSensor(YellowDogSensor):
         ):
             return self.check_status(
                 context,
-                worker_pool.id,
+                cast(str, worker_pool.id),
                 ObjectName.WORKER_POOL,
-                worker_pool.status,
+                cast(WorkerPoolStatus, worker_pool.status),
                 self.target_states,
                 self.target_states_names,
             )
@@ -311,7 +318,7 @@ class ComputeRequirementStateSensor(YellowDogSensor):
     :type poke_interval: float
     """
 
-    template_fields: Sequence[str] = (
+    template_fields: Collection[str] = (
         *YellowDogSensor.template_fields,
         "compute_requirement_id",
         "namespace",
@@ -350,21 +357,21 @@ class ComputeRequirementStateSensor(YellowDogSensor):
         Tests the compute requirement's status.
         """
 
-        client: PlatformClient = YellowDogHook(self.connection_id).get_conn()
+        client: PlatformClient = YellowDogHook(cast(str, self.connection_id)).get_conn()
 
         compute_requirement: ComputeRequirement = get_compute_requirement_by_id_or_name(
             client,
             self.log,
-            self.compute_requirement_id,
-            self.namespace,
-            self.compute_requirement_name,
+            cast(str | None, self.compute_requirement_id),
+            cast(str | None, self.namespace),
+            cast(str | None, self.compute_requirement_name),
         )
 
         return self.check_status(
             context,
-            compute_requirement.id,
+            cast(str, compute_requirement.id),
             ObjectName.COMPUTE_REQUIREMENT,
-            compute_requirement.status,
+            cast(ComputeRequirementStatus, compute_requirement.status),
             self.target_states,
             self.target_states_names,
         )
