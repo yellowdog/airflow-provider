@@ -11,7 +11,7 @@ CONNECTION_ID = "prod-yellowdog-yd-demo"  # Can also be set as a parameter
 
 # The compute requirement template and image family to use for the worker pool.
 # Must match items in the selected YellowDog account.
-CRT_NAME_OR_ID = "yd-demo/yd-demo-aws-gcp-azure-oci-split-spot"
+CRT_NAME_OR_ID = "yd-demo/yd-demo-aws-gcp-azure-oci-split-ondemand"
 IMAGE_FAMILY_NAME_OR_ID = "yellowdog/yd-agent-docker"
 
 # Namespace for work requirements and worker pool
