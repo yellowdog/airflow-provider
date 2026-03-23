@@ -4,8 +4,12 @@ YellowDog Airflow Operators for managing work requirements and worker pools.
 
 from collections.abc import Callable, Sequence
 
-from airflow.models import BaseOperator
-from airflow.utils.context import Context
+try:
+    from airflow.sdk.bases.operator import BaseOperator
+    from airflow.sdk.definitions.context import Context
+except ImportError:
+    from airflow.models import BaseOperator  # type: ignore[no-redef]
+    from airflow.utils.context import Context  # type: ignore[no-redef]
 from jinja2 import Environment
 from requests.exceptions import HTTPError
 from yellowdog_client import PlatformClient

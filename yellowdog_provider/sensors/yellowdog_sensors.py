@@ -7,8 +7,12 @@ set of states is reached.
 from collections.abc import Callable, Sequence
 from enum import Enum
 
-from airflow.sensors.base import BaseSensorOperator
-from airflow.utils.context import Context
+try:
+    from airflow.sdk.bases.sensor import BaseSensorOperator
+    from airflow.sdk.definitions.context import Context
+except ImportError:
+    from airflow.sensors.base import BaseSensorOperator  # type: ignore[no-redef]
+    from airflow.utils.context import Context  # type: ignore[no-redef]
 from jinja2 import Environment
 from yellowdog_client import PlatformClient
 from yellowdog_client.model import (

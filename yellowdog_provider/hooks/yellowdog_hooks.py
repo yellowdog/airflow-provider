@@ -12,7 +12,10 @@ HOOK_NAME = "YellowDog"
 
 from typing import Any
 
-from airflow.hooks.base import BaseHook
+try:
+    from airflow.sdk.bases.hook import BaseHook
+except ImportError:
+    from airflow.hooks.base import BaseHook  # type: ignore[no-redef]
 from yellowdog_client.platform_client import ApiKey, PlatformClient, ServicesSchema
 
 
