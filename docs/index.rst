@@ -68,7 +68,7 @@ When the ``get_conn()`` method of a ``YellowDogHook`` object is called, it retur
 The YellowDog Airflow Operators
 -------------------------------
 
-The YellowDog provider includes Airflow operators for creating and managing Yellowdog work requirements and worker pools.
+The YellowDog provider includes Airflow operators for creating and managing YellowDog work requirements and worker pools.
 
 Work Requirements
 ^^^^^^^^^^^^^^^^^
@@ -80,7 +80,7 @@ Adding a Work Requirement in Multiple Operations
 
 - The **AddTaskGroupsToWorkRequirement** operator adds one or more task groups to a work requirement. It takes the namespace and name of a work requirement (or a work requirement ID), and a list of ``TaskGroup`` objects defined in the YellowDog SDK.
 
-- The **AddTasksToTaskGroup** operator adds one or more to a task group. It takes the namespace and name of a work requirement, a task group name (or a task group ID), and a list of ``Task`` objects defined in the YellowDog SDK.
+- The **AddTasksToTaskGroup** operator adds one or more tasks to a task group. It takes the namespace and name of a work requirement, a task group name (or a task group ID), and a list of ``Task`` objects defined in the YellowDog SDK.
 
 Adding a Work Requirement in a Single Operation
 +++++++++++++++++++++++++++++++++++++++++++++++
@@ -103,7 +103,7 @@ Provisioning a Worker Pool
 Shutting Down a Worker Pool
 +++++++++++++++++++++++++++
 
-- The **ShutdownWorkerPool** operator shuts down a worker pool. It takes the namespace and name of the worker pool, or its YellowDog ID. By default, when shutting down a worker pool, no additional tasks are allocated to workers but any currently executing tasks are allowed to conclude. If the ``terminate_immediately`` argument is set to ``True``, then the worker pool's compute requirement is immediately terminated and all currently executing tasks will fail.
+- The **ShutdownProvisionedWorkerPool** operator shuts down a worker pool. It takes the namespace and name of the worker pool, or its YellowDog ID. By default, when shutting down a worker pool, no additional tasks are allocated to workers but any currently executing tasks are allowed to conclude. If the ``terminate_immediately`` argument is set to ``True``, then the worker pool's compute requirement is immediately terminated and all currently executing tasks will fail.
 
 The YellowDog Airflow Sensors
 -----------------------------
