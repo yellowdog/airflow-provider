@@ -302,9 +302,9 @@ class ComputeRequirementStateSensor(YellowDogSensor):
     :type task_id: str
     :param connection_id: connection to run the operator with (templated) or a
         Callable that generates the connection ID
+    :type connection_id: str | Callable
     :param target_states: the list of ComputeRequirementStatus states to test for
     :type target_states: list[ComputeRequirementStatus]
-    :type connection_id: str | Callable
     :param compute_requirement_id: the ID of the compute requirement (templated) or a
         Callable that returns the ID
     :type compute_requirement_id: str | Callable | None

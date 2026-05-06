@@ -565,7 +565,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
     :type connection_id: str | Callable
     :param worker_pool_id: the ID of the worker pool (templated) or
         a Callable that generates the ID
-    :type work_requirement_id: str | Callable | None
+    :type worker_pool_id: str | Callable | None
     :param namespace: the namespace of the worker pool (templated) or a
         Callable that generates the namespace
     :type namespace: str | Callable | None
