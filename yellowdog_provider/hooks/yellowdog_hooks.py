@@ -2,21 +2,28 @@
 Airflow Hook for the YellowDog API client.
 """
 
+from types import TracebackType
+from typing import Any
+
+from airflow.sdk import BaseHook
+from yellowdog_client.model import (
+    ApiKey,
+    NamespaceSearch,
+    ServicesSchema,
+    SliceReference,
+)
+from yellowdog_client.platform_client import PlatformClient
+
+from yellowdog_provider.exceptions.yellowdog_exceptions import YellowDogException
+
 PLATFORM_API_URL = "Platform API URL"
 PLATFORM_API_URL_DEFAULT = "https://api.yellowdog.ai"
 APP_KEY_ID_NAME = "Application Key ID"
 APP_KEY_SECRET_NAME = "Application Key Secret"
 CONNECTION_TYPE = "yellowdog"
-CONN_NAME_ATTR = "yellowdog_conn_id"
+CONN_NAME_ATTR = "connection_id"
+DEFAULT_CONN_NAME = "yellowdog_default"
 HOOK_NAME = "YellowDog"
-
-from typing import Any
-
-try:
-    from airflow.sdk.bases.hook import BaseHook
-except ImportError:
-    from airflow.hooks.base import BaseHook  # type: ignore[no-redef]
-from yellowdog_client.platform_client import ApiKey, PlatformClient, ServicesSchema
 
 
 class YellowDogHook(BaseHook):
@@ -27,6 +34,7 @@ class YellowDogHook(BaseHook):
 
     conn_type = CONNECTION_TYPE
     conn_name_attr = CONN_NAME_ATTR
+    default_conn_name = DEFAULT_CONN_NAME
     hook_name = HOOK_NAME
 
     @classmethod
@@ -46,32 +54,81 @@ class YellowDogHook(BaseHook):
             },
         }
 
-    def __init__(self, connection_id: str):
-        super().__init__()
+    def __init__(self, connection_id: str = default_conn_name, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
         self.connection_id = connection_id
         self.client: PlatformClient | None = None
+        self._platform_url = PLATFORM_API_URL_DEFAULT
+
+    @staticmethod
+    def _normalise_host(host: str | None) -> str:
+        host = (host or "").strip()
+        if not host:
+            return PLATFORM_API_URL_DEFAULT
+        if "://" not in host:
+            host = "https://" + host
+        return host.rstrip("/")
 
     def get_conn(self) -> PlatformClient:
         """
         Fetch the YellowDog PlatformClient object corresponding to the
-        connection ID.
+        connection ID. The client is created once and cached.
 
         :returns: a YellowDog PlatformClient object
-        :rtype: PlatformClient
+        :raises YellowDogException: if the connection lacks credentials
         """
         if self.client is None:
             connection = self.get_connection(self.connection_id)
+            if not connection.login:
+                raise YellowDogException(
+                    f"Connection '{self.connection_id}' has no {APP_KEY_ID_NAME}"
+                )
+            if not connection.password:
+                raise YellowDogException(
+                    f"Connection '{self.connection_id}' has no {APP_KEY_SECRET_NAME}"
+                )
 
-            platform_url = (
-                PLATFORM_API_URL_DEFAULT if connection.host == "" else connection.host
-            )
-
+            platform_url = self._normalise_host(connection.host)
             if platform_url != PLATFORM_API_URL_DEFAULT:
-                self.log.info(f"Using Platform API URL: {platform_url}")
+                self.log.info("Using Platform API URL: %s", platform_url)
 
+            self._platform_url = platform_url
             self.client = PlatformClient.create(
                 ServicesSchema(defaultUrl=platform_url),
                 ApiKey(connection.login, connection.password),
             )
 
         return self.client
+
+    def close(self) -> None:
+        """Close and discard the cached client, if any."""
+        if self.client is not None:
+            client, self.client = self.client, None
+            client.close()
+
+    def __enter__(self) -> "YellowDogHook":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def test_connection(self) -> tuple[bool, str]:
+        """
+        Verify the connection with one lightweight authenticated read
+        (the first namespace, if any).
+        """
+        try:
+            client = self.get_conn()
+            client.namespaces_client.get_namespaces(NamespaceSearch()).slice(
+                SliceReference(size=1)
+            )
+            return True, f"Successfully connected to {self._platform_url}"
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            self.close()

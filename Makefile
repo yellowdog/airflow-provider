@@ -1,49 +1,46 @@
 .DEFAULT_GOAL := no_op
 
-SRC = yellowdog_provider/*.py yellowdog_provider/*/*.py docs/*.py
-TESTS = tests/*.py tests/*/*.py
-STUBS = yellowdog_provider/exceptions/*.pyi yellowdog_provider/hooks/*.pyi yellowdog_provider/operators/*.pyi yellowdog_provider/sensors/*.pyi yellowdog_provider/utils/*.pyi
+.PHONY: build clean install uninstall format lint test check update docs \
+	docs-build-image docs-publish-image pypi-check-build no_op
+
 BUILD_DIST = build dist yellowdog_airflow_provider.egg-info
 PYCACHE = __pycache__
 
 VERSION_FILE := yellowdog_provider/__init__.py
 VERSION := $(shell grep "__version__ =" $(VERSION_FILE) | sed -E 's/.*"([^"]+)".*/\1/')
 
-build: $(SRC) stubs
+build:
 	python -m build
 
-stubs: $(SRC)
-	rm -f $(STUBS)
-	stubgen -o . yellowdog_provider/exceptions yellowdog_provider/hooks yellowdog_provider/operators yellowdog_provider/sensors yellowdog_provider/utils
-
 clean:
-	rm -rf $(BUILD_DIST) $(PYCACHE) $(STUBS)
+	rm -rf $(BUILD_DIST) $(PYCACHE) .ruff_cache .pytest_cache
 	$(MAKE) -C docs clean
 
 install: build
-	pip install -U -e .
+	pip install -U -e '.[dev]'
 
 uninstall:
-	pip uninstall -y airflow-provider-yellowdog
+	pip uninstall -y yellowdog-airflow-provider
 
-black: $(SRC) $(TESTS)
-	black --preview $(SRC) $(TESTS)
+format:
+	ruff format . && ruff check --fix .
 
-isort: $(SRC)
-	isort --profile black $(SRC) $(TESTS)
+lint:
+	ruff format --check . && ruff check .
 
-pyupgrade: $(SRC)
-	pyupgrade --exit-zero-even-if-changed --py310-plus $(SRC) $(TESTS)
+test:
+	pytest tests/unit
 
-format: pyupgrade isort black
+typecheck:
+	pyright && python bin/verify_types.py
+
+check: lint typecheck test docs
 
 update:
-	pip install -U -r requirements.txt -r requirements-dev.txt
-
-.PHONY: docs
+	pip install -U -e '.[dev]'
 
 docs:
-	$(MAKE) -C docs html
+	$(MAKE) -C docs html SPHINXOPTS="-W --keep-going"
 
 docs-build-image: docs
 	cd docs && docker build . -t yellowdogco/airflow-provider-docs:$(VERSION) --platform linux/amd64
@@ -51,17 +48,9 @@ docs-build-image: docs
 docs-publish-image: docs-build-image
 	docker push yellowdogco/airflow-provider-docs:$(VERSION)
 
-# See the ~/.pypirc file for the repository index
 pypi-check-build: clean build
 	twine check dist/*
 
-pypi-test-upload: clean build
-	python -m twine upload --repository yellowdog-testpypi dist/*
-
-pypi-prod-upload: clean build
-	python -m twine upload --repository yellowdog-airflow-provider dist/*
-
 no_op:
-	# Available targets are: build, clean, install, uninstall, format, update, docs,
-	# docs-build-image, docs-publish-image, pypi-check-build, stubs
-	# pypi-test-upload, pypi-prod-upload
+	# Available targets are: build, clean, install, uninstall, format, lint, test,
+	# check, update, docs, docs-build-image, docs-publish-image, pypi-check-build

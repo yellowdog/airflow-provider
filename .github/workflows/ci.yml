@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [next-version]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+          activate-environment: true
+          enable-cache: true
+      - run: uv pip install -e '.[dev]'
+      - run: make lint
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+          activate-environment: true
+          enable-cache: true
+      - run: uv pip install -e '.[dev]'
+      - run: make typecheck
+
+  test:
+    name: test (py${{ matrix.python }}, airflow ${{ matrix.airflow }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python: "3.12", airflow: "3.1.0" }
+          - { python: "3.13", airflow: "3.1.0" }
+          - { python: "3.12", airflow: "latest" }
+          - { python: "3.14", airflow: "latest" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          activate-environment: true
+          enable-cache: true
+      - name: Resolve Airflow version
+        id: airflow
+        run: |
+          if [ "${{ matrix.airflow }}" = "latest" ]; then
+            V=$(curl -fsSL https://pypi.org/pypi/apache-airflow/json | jq -r .info.version)
+          else
+            V="${{ matrix.airflow }}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Install with Airflow constraints
+        env:
+          AIRFLOW_VERSION: ${{ steps.airflow.outputs.version }}
+          PY: ${{ matrix.python }}
+          # Minimum-Airflow rows also test the declared yellowdog-sdk floor.
+          SDK_PIN: ${{ matrix.airflow != 'latest' && 'yellowdog-sdk==15.2.0' || '' }}
+        run: |
+          pkgs=("apache-airflow==${AIRFLOW_VERSION}" -e '.[dev]')
+          if [ -n "${SDK_PIN}" ]; then pkgs+=("${SDK_PIN}"); fi
+          uv pip install "${pkgs[@]}" \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PY}.txt"
+      - run: make test
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+          activate-environment: true
+          enable-cache: true
+      - run: uv pip install -e '.[dev]'
+      - run: make docs
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+          activate-environment: true
+          enable-cache: true
+      - run: uv pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - run: python -m zipfile -l dist/*.whl | grep -q py.typed

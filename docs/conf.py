@@ -25,7 +25,7 @@ os.environ.setdefault("AIRFLOW__METRICS__TIMER_UNIT_CONSISTENCY", "True")
 
 from yellowdog_provider import __version__
 
-project = f"YellowDog Provider for Apache Airflow"
+project = "YellowDog Provider for Apache Airflow"
 copyright = f"{date.today().year}, YellowDog Limited. Version {__version__}"
 author = "YellowDog Limited"
 release = __version__

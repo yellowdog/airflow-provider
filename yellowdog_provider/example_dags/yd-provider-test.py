@@ -5,9 +5,13 @@ Test the YellowDog Provider.
 ###############################################################################
 # Adjust the following to alter identity and behaviour
 
+# The defaults below seed the DAG's Airflow params, which can be overridden per
+# run (e.g. `--conf '{"namespace": "x"}'`). All of them are read from the
+# run's params at run time.
+
 # The YellowDog Application credentials to use, contained in an Airflow
 # Connection.
-CONNECTION_ID = "prod-yellowdog-yd-demo"  # Can also be set as a parameter
+CONNECTION_ID = "prod-yellowdog-yd-demo"  # Param: connection_id
 
 # The compute requirement template and image family to use for the worker pool.
 # Must match items in the selected YellowDog account.
@@ -15,7 +19,7 @@ CRT_NAME_OR_ID = "yd-demo/yd-demo-aws-gcp-azure-oci-split-ondemand"
 IMAGE_FAMILY_NAME_OR_ID = "yellowdog/yd-agent-docker"
 
 # Namespace for work requirements and worker pool
-NAMESPACE = "airflow-testing"  # Can also be set as a parameter
+NAMESPACE = "airflow-testing"  # Param: namespace
 
 # Worker pool scaling properties
 TARGET_INSTANCES = 1
@@ -26,16 +30,19 @@ POOL_SHUTDOWN_TIMER_MINUTES = 2
 # Work requirements
 TASK_GROUP_NAME_PREFIX = "task-group"
 TASK_NAME = "task_1"
-TASK_TYPE = "docker"
-TASK_ARGS = ["hello-world"]
+TASK_TYPE = "docker"  # Param: task_type
+TASK_ARGS = ["hello-world"]  # Param: task_arguments
 FIRST_WR_PREFIX = "a-"
 SECOND_WR_PREFIX = "b-"
 SECOND_WR_NUM_ADDED_TASK_GROUPS = 2
 SECOND_WR_NUM_ADDED_TASKS = 2
 
-# Polling interval and timeout for sensors
+# Polling interval and timeout for sensors. A sensor's `timeout` is fixed when
+# the DAG is parsed and cannot be templated, so the sensors start with this
+# value and `_apply_sensor_timeout` replaces it with the run's
+# `sensor_timeout_seconds` param just before each sensor executes.
 POKE_INTERVAL_SECONDS = 10.0
-SENSOR_TIMEOUT_SECONDS = 300.0
+SENSOR_TIMEOUT_SECONDS = 300.0  # Param: sensor_timeout_seconds
 
 # The name of the DAG in Airflow
 DAG_ID = "yellowdog-provider-test"
@@ -44,20 +51,16 @@ DAG_ID = "yellowdog-provider-test"
 
 from datetime import timedelta
 from re import sub
+from typing import Any, cast
 
-try:
-    from airflow.sdk import dag
-    from airflow.sdk.definitions.context import Context
-    from airflow.task.trigger_rule import TriggerRule
-except ImportError:
-    from airflow.decorators import dag  # type: ignore[no-redef]
-    from airflow.utils.context import Context  # type: ignore[no-redef]
-    from airflow.utils.trigger_rule import TriggerRule  # type: ignore[no-redef]
-try:
-    from airflow.sdk.types import TaskInstance
-except ImportError:
-    from airflow.models import TaskInstance  # type: ignore[no-redef]
-from airflow.models import BaseOperator
+from airflow.sdk import (
+    BaseOperator,
+    BaseSensorOperator,
+    Context,
+    TriggerRule,
+    dag,  # pyright: ignore[reportUnknownVariableType]  # Airflow's @dag overloads are partially untyped
+)
+from airflow.sdk.types import RuntimeTaskInstanceProtocol
 from jinja2 import Environment
 from yellowdog_client.common import SearchClient
 from yellowdog_client.model import (
@@ -99,7 +102,15 @@ from yellowdog_provider.sensors.yellowdog_sensors import (
 
 @dag(
     dag_id=DAG_ID,
-    params={"namespace": NAMESPACE, "connection_id": CONNECTION_ID},
+    params={
+        "connection_id": CONNECTION_ID,
+        "namespace": NAMESPACE,
+        "compute_requirement_template": CRT_NAME_OR_ID,
+        "image_family": IMAGE_FAMILY_NAME_OR_ID,
+        "task_type": TASK_TYPE,
+        "task_arguments": TASK_ARGS,
+        "sensor_timeout_seconds": SENSOR_TIMEOUT_SECONDS,
+    },
 )
 def yd_provider_test():
 
@@ -161,6 +172,7 @@ def yd_provider_test():
         ],
         poke_interval=POKE_INTERVAL_SECONDS,
         timeout=SENSOR_TIMEOUT_SECONDS,
+        pre_execute=_apply_sensor_timeout,
     )
 
     wait_for_work_requirement_2_to_finish = WorkRequirementStateSensor(
@@ -175,6 +187,7 @@ def yd_provider_test():
         ],
         poke_interval=POKE_INTERVAL_SECONDS,
         timeout=SENSOR_TIMEOUT_SECONDS,
+        pre_execute=_apply_sensor_timeout,
     )
 
     shut_down_worker_pool = ShutdownProvisionedWorkerPool(
@@ -200,6 +213,7 @@ def yd_provider_test():
         target_states=[WorkerPoolStatus.SHUTDOWN, WorkerPoolStatus.TERMINATED],
         poke_interval=POKE_INTERVAL_SECONDS,
         timeout=SENSOR_TIMEOUT_SECONDS,
+        pre_execute=_apply_sensor_timeout,
         trigger_rule=TriggerRule.ALL_DONE,
     )
 
@@ -213,6 +227,7 @@ def yd_provider_test():
         ],
         poke_interval=POKE_INTERVAL_SECONDS,
         timeout=SENSOR_TIMEOUT_SECONDS,
+        pre_execute=_apply_sensor_timeout,
         trigger_rule=TriggerRule.ALL_DONE,
     )
 
@@ -235,7 +250,7 @@ def yd_provider_test():
     # # Establish Airflow DAG task dependencies
     # # Note: not intended to be realistic; this is just to exercise all the YellowDog classes
 
-    (
+    _ = (
         provision_worker_pool
         >> add_work_requirement
         >> add_task_groups_to_work_requirement
@@ -245,22 +260,22 @@ def yd_provider_test():
         >> shut_down_worker_pool
     )
 
-    (
+    _ = (
         provision_worker_pool
         >> add_populated_work_requirement
         >> wait_for_work_requirement_2_to_finish
         >> shut_down_worker_pool
     )
 
-    (
+    _ = (
         shut_down_worker_pool
         >> wait_for_worker_pool_to_shut_down
         >> terminate_worker_pool
         >> wait_for_compute_requirement_to_terminate
     )
 
-    shut_down_worker_pool >> cancel_work_requirement_1
-    shut_down_worker_pool >> cancel_work_requirement_2
+    _ = shut_down_worker_pool >> cancel_work_requirement_1
+    _ = shut_down_worker_pool >> cancel_work_requirement_2
 
 
 ###############################################################################
@@ -272,14 +287,15 @@ def gen_namespace(context: Context, jinja_env: Environment) -> str:
     """
     Example of acquiring the 'namespace' directly from the context.
     """
-    return context["params"]["namespace"]
+    return _params(context)["namespace"]
 
 
 def gen_work_requirement_1(context: Context, jinja_env: Environment) -> WorkRequirement:
     """
     Example using simple jinja templating to acquire the 'namespace'.
     """
-    task: BaseOperator = context["task"]
+    task = context.get("task")  # pyright: ignore[reportUnknownMemberType]  # Airflow Context.get overloads are partially untyped
+    assert isinstance(task, BaseOperator)
     return WorkRequirement(
         namespace=task.render_template("{{ params.namespace }}", context, jinja_env),
         name=_get_wr_name(context, FIRST_WR_PREFIX),
@@ -299,8 +315,8 @@ def gen_crtu(
     return ComputeRequirementTemplateUsage(
         requirementName=_get_wp_name(context),
         targetInstanceCount=TARGET_INSTANCES,
-        templateId=CRT_NAME_OR_ID,
-        imagesId=_get_images_id(IMAGE_FAMILY_NAME_OR_ID),
+        templateId=_params(context)["compute_requirement_template"],
+        imagesId=_get_images_id(_params(context)["image_family"], context),
         requirementNamespace=gen_namespace(context, Environment()),
     )
 
@@ -336,9 +352,9 @@ def gen_wp_name(context: Context, jinja_env: Environment) -> str:
     return _get_wp_name(context)
 
 
-def gen_task_groups(context, jinja_env: Environment) -> list[TaskGroup]:
+def gen_task_groups(context: Context, jinja_env: Environment) -> list[TaskGroup]:
     run_specification = RunSpecification(
-        taskTypes=[TASK_TYPE], workerTags=[_get_worker_tag(context)]
+        taskTypes=[_params(context)["task_type"]], workerTags=[_get_worker_tag(context)]
     )
     return [
         TaskGroup(name=f"task-group-{x}", runSpecification=run_specification)
@@ -348,18 +364,20 @@ def gen_task_groups(context, jinja_env: Environment) -> list[TaskGroup]:
 
 def gen_tasks(context: Context, jinja_env: Environment) -> list[Task]:
     return [
-        Task(name=f"task-{x}", taskType=TASK_TYPE, arguments=TASK_ARGS)
+        Task(
+            name=f"task-{x}",
+            taskType=_params(context)["task_type"],
+            arguments=_params(context)["task_arguments"],
+        )
         for x in range(1, SECOND_WR_NUM_ADDED_TASKS + 1)
     ]
 
 
 def gen_task_groups_and_tasks(
-    context: Context,
-    jinja_env: Environment,
-    prefix: str = "",
+    context: Context, jinja_env: Environment
 ) -> list[tuple[TaskGroup, list[Task]]]:
     run_specification = RunSpecification(
-        taskTypes=[TASK_TYPE], workerTags=[_get_worker_tag(context)]
+        taskTypes=[_params(context)["task_type"]], workerTags=[_get_worker_tag(context)]
     )
     task_group_1 = TaskGroup(
         name=TASK_GROUP_NAME_PREFIX + "_1", runSpecification=run_specification
@@ -369,14 +387,30 @@ def gen_task_groups_and_tasks(
     )
     task = Task(
         name=TASK_NAME,
-        taskType=TASK_TYPE,
-        arguments=TASK_ARGS,
+        taskType=_params(context)["task_type"],
+        arguments=_params(context)["task_arguments"],
     )
     return [(task_group_1, [task]), (task_group_2, [task])]
 
 
 ###############################################################################
 # Generate unique names using the Airflow run ID from the context
+
+
+def _params(context: Context) -> dict[str, Any]:
+    """
+    The DAG params for this run (defaults overlaid with any `--conf`).
+    """
+    return cast("dict[str, Any]", context)["params"]
+
+
+def _apply_sensor_timeout(context: Context) -> None:
+    """
+    Sensor `pre_execute` hook: take the sensor's timeout from the run's params.
+    """
+    sensor = cast("dict[str, Any]", context)["task"]
+    assert isinstance(sensor, BaseSensorOperator)
+    sensor.timeout = float(_params(context)["sensor_timeout_seconds"])
 
 
 def _get_wr_name(context: Context, prefix: str = "") -> str:
@@ -392,7 +426,8 @@ def _get_worker_tag(context: Context) -> str:
 
 
 def _get_entity_name(context: Context, prefix: str) -> str:
-    task_instance: TaskInstance = context["ti"]
+    task_instance: RuntimeTaskInstanceProtocol | None = context.get("ti")  # pyright: ignore[reportUnknownMemberType]  # Airflow Context.get overloads are partially untyped
+    assert task_instance is not None
     return _normalise_yd_name(f"{prefix}-{task_instance.run_id}").replace(
         "manual__", ""
     )
@@ -416,10 +451,11 @@ def _normalise_yd_name(name: str) -> str:
 # YellowDog Utilities
 
 
-def _get_images_id(image_family_name: str) -> str:
+def _get_images_id(image_family_name: str, context: Context) -> str:
     """
     Convert an image family namespace/name into an ID.
-    Return the original name if not found.
+    Return the original name if not found. The connection comes from the run's
+    `connection_id` param.
     """
     namespace_and_name = image_family_name.split("/")
     if len(namespace_and_name) != 2:
@@ -429,16 +465,16 @@ def _get_images_id(image_family_name: str) -> str:
     image_family_search = MachineImageFamilySearch(
         namespace=namespace, familyName=name, includePublic=True
     )
-    client = YellowDogHook(CONNECTION_ID).get_conn()
-    search_client: SearchClient = client.images_client.get_image_families(
-        image_family_search
+    client = YellowDogHook(_params(context)["connection_id"]).get_conn()
+    search_client: SearchClient[MachineImageFamilySummary] = (
+        client.images_client.get_image_families(image_family_search)
     )
     image_families: list[MachineImageFamilySummary] = search_client.list_all()
 
     # Partial names will match, so find an exact match
     for image_family in image_families:
         if image_family.name == name:
-            return image_family.id
+            return image_family.id or image_family_name
 
     return image_family_name
 
@@ -446,6 +482,6 @@ def _get_images_id(image_family_name: str) -> str:
 ###############################################################################
 # Run the DAG
 
-yd_provider_test()
+dag = yd_provider_test()
 
 ###############################################################################

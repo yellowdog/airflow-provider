@@ -6,16 +6,17 @@
     name = "yellowdog-airflow-provider"
     description = "YellowDog Provider for Apache Airflow."
     classifiers = [
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
         "Operating System :: OS Independent",
         "Development Status :: 4 - Beta",
         "Framework :: Apache Airflow",
         "Framework :: Apache Airflow :: Provider",
     ]
-    requires-python = ">= 3.10, < 3.13"
-    dynamic = ["dependencies", "version"]
+    requires-python = ">=3.12, <3.15"
+    dynamic = ["version"]
+    dependencies = ["apache-airflow>=3.1", "yellowdog-sdk>=15.2.0"]
     license = "Apache-2.0"
 
 [[project.authors]]
@@ -33,11 +34,50 @@
 [project.entry-points.apache_airflow_provider]
     provider_info = "yellowdog_provider.__init__:get_provider_info"
 
-[tool.setuptools.dynamic.dependencies]
-    file = ["requirements.txt"]
+[project.optional-dependencies]
+    dev = [
+        "build",
+        "jsonschema",
+        "pyright",
+        "pytest",
+        "ruff",
+        "sphinx",
+        "sphinx-rtd-theme",
+        "twine",
+        "wheel",
+    ]
+
+[tool.setuptools.package-data]
+    yellowdog_provider = ["py.typed"]
 
 [tool.setuptools]
     include-package-data = true
 
 [tool.setuptools.dynamic.version]
     attr = "yellowdog_provider.__version__"
+
+[tool.ruff]
+    line-length = 88
+    target-version = "py312"
+    extend-exclude = ["dag-test.py"]
+
+[tool.ruff.lint]
+    select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+    "yellowdog_provider/example_dags/*" = ["E402", "E501"]
+    "docs/conf.py" = ["E402"]
+
+[tool.pyright]
+    include = ["yellowdog_provider", "tests", "bin"]
+    pythonVersion = "3.12"
+    strict = ["yellowdog_provider", "tests/typecheck"]
+    reportUnnecessaryTypeIgnoreComment = "error"
+
+[tool.pytest.ini_options]
+    testpaths = ["tests"]
+    markers = [
+        "system: live YellowDog platform tests",
+        "e2e: full Airflow end-to-end test",
+    ]
+    addopts = "-m 'not system and not e2e'"
