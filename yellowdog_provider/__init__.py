@@ -15,7 +15,33 @@ def get_provider_info() -> dict[str, Any]:
                 "hook-class-name": (
                     "yellowdog_provider.hooks.yellowdog_hooks.YellowDogHook"
                 ),
+                "hook-name": "YellowDog",
+                # Read by Airflow 3.2+ (older versions use the hook's methods)
+                "conn-fields": {
+                    "portal_url": {
+                        "label": "Portal URL",
+                        "description": (
+                            "Optional. Base URL of the YellowDog Portal, used for "
+                            "task links. Default: the Platform API URL with a "
+                            "leading 'api.' replaced by 'portal.'."
+                        ),
+                        "schema": {"type": ["string", "null"]},
+                    },
+                },
+                "ui-field-behaviour": {
+                    "hidden-fields": ["schema", "port"],
+                    "relabeling": {
+                        "host": "Platform API URL",
+                        "login": "Application Key ID",
+                        "password": "Application Key Secret",
+                    },
+                    "placeholders": {"host": "https://api.yellowdog.ai"},
+                },
             },
+        ],
+        "extra-links": [
+            "yellowdog_provider.links.yellowdog_links.WorkRequirementPortalLink",
+            "yellowdog_provider.links.yellowdog_links.WorkerPoolPortalLink",
         ],
         "integrations": [
             {
@@ -40,6 +66,12 @@ def get_provider_info() -> dict[str, Any]:
             {
                 "integration-name": "YellowDog",
                 "python-modules": ["yellowdog_provider.sensors.yellowdog_sensors"],
+            },
+        ],
+        "triggers": [
+            {
+                "integration-name": "YellowDog",
+                "python-modules": ["yellowdog_provider.triggers.yellowdog_triggers"],
             },
         ],
     }

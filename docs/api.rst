@@ -11,5 +11,7 @@ explanations and examples, see :doc:`connections`, :doc:`operators`,
    yellowdog_provider.hooks
    yellowdog_provider.operators
    yellowdog_provider.sensors
+   yellowdog_provider.links
+   yellowdog_provider.triggers
    yellowdog_provider.exceptions
    yellowdog_provider.utils

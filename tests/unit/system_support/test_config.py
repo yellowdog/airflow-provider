@@ -12,6 +12,7 @@ from tests.system.config import (
     config_path,
     load_config,
     new_run_tag,
+    task_arguments_or_skip,
 )
 
 FULL = """
@@ -227,3 +228,56 @@ def test_airflow_labels_env_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
         airflow_labels(["min"])
     assert AIRFLOW_ENV_VAR in str(exc.value)
     assert "latest" in str(exc.value)
+
+
+def test_failing_and_long_task_arguments_docker_defaults(tmp_path: Path) -> None:
+    cfg = load_config(write(tmp_path, MINIMAL))  # task_type defaults to docker
+    assert cfg.task_type == "docker"
+    assert cfg.failing_task_arguments == ("alpine", "false")
+    assert cfg.long_task_arguments == ("alpine", "sleep", "900")
+
+
+def test_failing_and_long_task_arguments_bash_defaults(tmp_path: Path) -> None:
+    cfg = load_config(write(tmp_path, MINIMAL + 'task_type = "bash"\n'))
+    assert cfg.failing_task_arguments == ("-c", "exit 1")
+    assert cfg.long_task_arguments == ("-c", "sleep 900")
+
+
+def test_failing_and_long_task_arguments_unknown_type_unset(tmp_path: Path) -> None:
+    cfg = load_config(write(tmp_path, MINIMAL + 'task_type = "custom"\n'))
+    assert cfg.failing_task_arguments is None
+    assert cfg.long_task_arguments is None
+    with pytest.raises(pytest.skip.Exception, match="no default for task type"):
+        task_arguments_or_skip(cfg, "failing_task_arguments")
+    with pytest.raises(
+        pytest.skip.Exception, match=re.escape("resources.long_task_arguments")
+    ):
+        task_arguments_or_skip(cfg, "long_task_arguments")
+
+
+@pytest.mark.parametrize("task_type", ["bash", "docker", "custom"])
+def test_explicit_task_arguments_win(tmp_path: Path, task_type: str) -> None:
+    text = (
+        MINIMAL
+        + f'task_type = "{task_type}"\n'
+        + 'failing_task_arguments = ["f"]\nlong_task_arguments = ["l", "m"]\n'
+    )
+    cfg = load_config(write(tmp_path, text))
+    assert cfg.failing_task_arguments == ("f",)
+    assert task_arguments_or_skip(cfg, "long_task_arguments") == ["l", "m"]
+
+
+def test_failing_and_long_task_arguments_configured(tmp_path: Path) -> None:
+    text = (
+        MINIMAL + 'failing_task_arguments = ["x", "y"]\nlong_task_arguments = ["z"]\n'
+    )
+    cfg = load_config(write(tmp_path, text))
+    assert cfg.failing_task_arguments == ("x", "y")
+    assert cfg.long_task_arguments == ("z",)
+
+
+@pytest.mark.parametrize("key", ["failing_task_arguments", "long_task_arguments"])
+@pytest.mark.parametrize("value", ["[]", '"false"', "[1]"])
+def test_task_arguments_lists_invalid(tmp_path: Path, key: str, value: str) -> None:
+    with pytest.raises(ConfigError, match=f"resources.{key}"):
+        load_config(write(tmp_path, MINIMAL + f"{key} = {value}\n"))

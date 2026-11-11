@@ -42,7 +42,15 @@ Poke interval, timeout and mode
    If the condition is not met within ``timeout`` seconds the sensor fails.
    In the default ``mode="poke"`` the sensor occupies a worker slot for the
    whole wait; with ``mode="reschedule"`` it releases the slot between
-   pokes, which is better for long waits.
+   pokes, which is better for long waits. The provider's operators that wait
+   take ``poke_interval`` and ``timeout`` too.
+
+Deferral and the triggerer
+   A *deferrable* task can hand a wait over to Airflow's *triggerer*, a
+   separate Airflow component that runs many small asynchronous waits, and
+   give up its worker slot until the wait is over. The provider's waiting
+   operators and sensors take ``deferrable=True``; it needs a running
+   triggerer. See :ref:`deferral`.
 
 XCom
    *Cross-communication*: small values passed between tasks. When an operator
@@ -68,11 +76,23 @@ Templating
    templated field may also be given a Python callable, which Airflow calls
    to produce the value. See :doc:`templating`.
 
-Trigger rules (for teardown)
-   By default a task runs only if all its upstream tasks succeeded
-   (``all_success``). Clean-up tasks, such as shutting down a worker pool,
-   should run even when something upstream failed, so give them
-   ``trigger_rule=TriggerRule.ALL_DONE``.
+Setup and teardown
+   By default a task runs only if all its upstream tasks succeeded. A
+   clean-up task, such as shutting down a worker pool, must run even when
+   the work failed. Mark the task that creates the resource with
+   ``.as_setup()`` and the one that removes it with
+   ``.as_teardown(setups=...)``: Airflow then runs the teardown once the
+   tasks in between have finished, however they ended (unless the setup
+   itself failed), and the teardown's own result does not decide the DAG
+   run's outcome. (The older way, ``trigger_rule=TriggerRule.ALL_DONE``,
+   still works.)
+
+Retries and clearing
+   A failed task is retried up to ``retries`` times. *Clearing* a task
+   instance in the UI or CLI runs it again, even if it succeeded. The
+   provider's submitting operators treat the two differently: a retry
+   carries on with the earlier attempt's work, a clear runs it again. See
+   :ref:`safe-retries`.
 
 For depth, see the Airflow documentation on `DAGs
 <https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html>`_,
@@ -178,7 +198,11 @@ resource to reach a state.
      - Reads a ``yellowdog`` Airflow **connection** (an Application's key and
        secret, plus an optional Platform API URL) and returns an SDK
        ``PlatformClient``. Used by every operator and sensor; can also be used
-       directly in your own tasks.
+       directly in your own tasks (see :doc:`taskflow`).
+   * - :class:`~yellowdog_provider.operators.yellowdog_operators.RunWorkRequirement`
+     - Submits a **work requirement** with its **task groups** and **tasks**,
+       waits until it completes, and fails if it fails or is cancelled.
+       Cancels it if it gives up. Returns its ID.
    * - :class:`~yellowdog_provider.operators.yellowdog_operators.AddWorkRequirement`
      - Submits a **work requirement**. Returns its ID.
    * - :class:`~yellowdog_provider.operators.yellowdog_operators.AddTaskGroupsToWorkRequirement`
@@ -193,11 +217,12 @@ resource to reach a state.
      - Cancels a work requirement, optionally aborting running tasks.
    * - :class:`~yellowdog_provider.operators.yellowdog_operators.ProvisionWorkerPool`
      - Provisions a **worker pool** and its **compute requirement** from a
-       **compute requirement template**. Returns the worker pool's ID.
+       **compute requirement template**, optionally waiting until the pool is
+       ready. Returns the worker pool's ID. Typically a setup task.
    * - :class:`~yellowdog_provider.operators.yellowdog_operators.ShutdownProvisionedWorkerPool`
-     - Shuts down a provisioned worker pool, optionally terminating its
-       compute requirement immediately. Typically a teardown task with
-       ``trigger_rule=TriggerRule.ALL_DONE``.
+     - Cancels the DAG run's unfinished work requirements, then shuts down a
+       provisioned worker pool, optionally terminating its compute
+       requirement immediately. Typically a teardown task.
    * - :class:`~yellowdog_provider.sensors.yellowdog_sensors.WorkRequirementStateSensor`
      - **Sensor**: waits for a work requirement to reach given states (for
        example ``COMPLETED``), failing if it reaches a failure state (by
@@ -215,13 +240,15 @@ the ``run_id``). Arguments that hold SDK objects are supplied either as
 objects or as **callables** that build them at run time; see
 :doc:`templating`.
 
-A typical DAG:
+A typical DAG has three tasks (see :doc:`workflow`):
 
-#. ``ProvisionWorkerPool`` creates a pool whose workers carry a worker tag.
-#. ``WorkerPoolStateSensor`` waits for the pool to reach ``IDLE`` or
-   ``RUNNING``.
-#. ``AddPopulatedWorkRequirement`` submits work whose run specification
-   targets that worker tag.
-#. ``WorkRequirementStateSensor`` waits for the work to finish.
-#. ``ShutdownProvisionedWorkerPool`` (trigger rule ``ALL_DONE``) shuts the
-   pool down whatever happened upstream.
+#. ``ProvisionWorkerPool`` (a setup task, ``wait_until_ready=True``) creates
+   a pool whose workers carry a worker tag, and waits until it is ``IDLE``
+   or ``RUNNING``.
+#. ``RunWorkRequirement`` submits work whose run specification targets that
+   worker tag, and waits until it completes.
+#. ``ShutdownProvisionedWorkerPool`` (the teardown) cancels any of the run's
+   work still running and shuts the pool down, whatever happened upstream.
+
+The finer-grained operators and the sensors split these steps into more
+tasks; see :doc:`step-by-step`.

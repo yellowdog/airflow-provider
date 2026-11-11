@@ -16,6 +16,14 @@ image_family = "<namespace>/<image family>"
 # user_data_file = "userdata.sh"
 task_type = "docker"
 task_arguments = ["hello-world"]
+# Arguments (for task_type) of a task that exits non-zero, used to test failure
+# handling, and of one that runs for several minutes (longer than it takes the
+# e2e trigger-kill check to act), used to test cancellation. Defaults depend on
+# task_type: "docker" uses ["alpine", "false"] and ["alpine", "sleep", "900"];
+# "bash" uses ["-c", "exit 1"] and ["-c", "sleep 900"]. Any other task type
+# has no defaults: set these, or the tests that need them are skipped.
+# failing_task_arguments = ["alpine", "false"]
+# long_task_arguments = ["alpine", "sleep", "900"]
 
 [limits]
 # Worker pool size for the component tests; also the example DAG's max_nodes

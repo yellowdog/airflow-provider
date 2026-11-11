@@ -85,3 +85,43 @@ class YellowDogStateError(YellowDogException, _AirflowFailBase):
                 self.name,
             ),
         )
+
+
+class WaitTimeoutError(YellowDogException):
+    """
+    An operator's own wait for a resource timed out before the resource
+    reached a target or failure state.
+
+    Deliberately not an ``AirflowFailException`` (unlike
+    :exc:`.YellowDogStateError`): a timeout says nothing final about the
+    resource, and operators that cancel on timeout leave nothing behind, so
+    Airflow's task retries may usefully resubmit a fresh copy.
+
+    :param kind: the kind of resource, e.g. ``"work requirement"``
+    :param resource_id: the resource's ID, if known
+    :param last_state: the last state observed
+    :param timeout: the timeout that expired, in seconds
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        resource_id: str | None,
+        last_state: Enum,
+        timeout: float,
+    ) -> None:
+        self.kind = kind
+        self.resource_id = resource_id
+        self.last_state = last_state
+        self.timeout = timeout
+        label = f"ID '{resource_id}'" if resource_id is not None else "(ID unknown)"
+        super().__init__(
+            f"Timed out after {timeout:g} seconds waiting for {kind} {label}; "
+            f"last status was '{last_state.value}'"
+        )
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (
+            type(self),
+            (self.kind, self.resource_id, self.last_state, self.timeout),
+        )

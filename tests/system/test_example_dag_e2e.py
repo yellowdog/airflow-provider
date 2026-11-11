@@ -1,10 +1,26 @@
 """
-End-to-end test: the example DAG run to completion under a real Airflow.
+End-to-end tests: the example DAG run under a real Airflow.
 
-The test drives the Docker CLI. It starts an Airflow container, installs the
-provider, adds a YellowDog connection, then triggers
-``yellowdog-provider-test`` with params taken from the system-test config and
-waits for the DAG run to finish.
+The tests drive the Docker CLI. For each Airflow version, a module-scoped
+fixture starts an Airflow container, installs the provider, adds a YellowDog
+connection, and triggers ``yellowdog-provider-test`` twice with params taken
+from the system-test config; the two DAG runs proceed concurrently:
+
+* the main run (``deferrable=true``: every wait is deferred to the
+  triggerer, which ``airflow standalone`` runs) must succeed in full;
+* the failure run (``task_arguments`` = ``resources.failing_task_arguments``,
+  not deferred; skipped if that is unset with no default for the task type)
+  must fail, with both run tasks failed and the teardown
+  (``shutdown-worker-pool``) successful.
+
+On Airflow 3.3 and later, a third run checks the trigger kill hook: with
+long-running work (``resources.long_task_arguments``) and both run tasks
+deferred, one is marked failed through the REST API (as the
+SimpleAuthManager's generated admin user), and its work requirement must be
+cancelled by the trigger's ``on_kill`` while the other is still deferred.
+
+After each run, nothing of it (work requirement, pool or compute requirement)
+may be left live.
 
 Airflow deployment: ``airflow standalone`` (one process running the API server,
 scheduler, dag-processor and triggerer against a shared SQLite database), not
@@ -17,21 +33,24 @@ process supervision. If a live run shows standalone unsuitable, fall back to
 the four separate services as in ``bin/start-airflow-container.sh``.
 This has been verified live with ``airflow standalone``.
 
-The DAG derives every YellowDog resource name from the Airflow run id, and the
-test uses the run tag as run id, so all resource names contain the run tag
-(lower-cased, which it already is) and the ``yd_client`` sweep can find
-leftovers.
+The DAG derives every YellowDog resource name from the Airflow run id. Each
+run's id is ``<label>-<scenario>-<run tag>``. Names are shortened to 60
+characters, so the id puts what tells runs apart first, and the second work
+requirement's derived name holds only part of the run id; so every run's pool
+and first work requirement names, and its
+run tag prefix (which every work requirement it submits carries in its tag),
+are registered with the ``yd_client`` sweep, which finds leftovers by any of
+these as well as by the run tag.
 
 Airflow versions: the test is parametrised over ``e2e.airflow_versions`` in the
 config (default ``["min", "max"]``; ``YD_SYSTEM_TEST_AIRFLOW`` overrides it),
-resolved by ``bin/airflow_versions.py`` when each test starts (not at
+resolved by ``bin/airflow_versions.py`` when the fixture starts (not at
 collection): ``min`` is the ``apache-airflow`` floor in ``pyproject.toml``,
 ``max`` the latest release on PyPI, or an explicit X.Y.Z. Each version runs in
 ``apache/airflow:slim-<version>-python3.12`` (pulled first; the test fails,
 naming the tag, if a new Airflow release has no such image yet), installs
 the provider against that version's Airflow constraints (with the latest
-``yellowdog-sdk``, never pinned), and uses its own container and DAG run id,
-``<run tag>-<label>``.
+``yellowdog-sdk``, never pinned), and uses its own container and DAG run ids.
 
 Optional Airflow UI access: set ``ui_port`` under ``[e2e]`` in the config to
 publish the container's UI on ``127.0.0.1:<ui_port>`` (the n-th version tested
@@ -46,16 +65,23 @@ subprocess environment), never on a command line.
 
 import json
 import os
+import re
 import subprocess
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import pytest
+from yellowdog_client.model import WorkRequirementStatus
 from yellowdog_client.platform_client import PlatformClient
 
+from tests.system.cleanup import (
+    find_compute_requirements,
+    find_work_requirements,
+    find_worker_pools,
+)
 from tests.system.config import (
     DEFAULT_AIRFLOW_VERSIONS,
     ConfigError,
@@ -63,8 +89,10 @@ from tests.system.config import (
     airflow_labels,
     config_path,
     load_config,
+    task_arguments_or_skip,
 )
 from tests.system.versions import VersionError, constraints_url, resolve
+from yellowdog_provider.utils.run_stamp import RunStamp
 
 pytestmark = pytest.mark.e2e
 
@@ -149,7 +177,10 @@ def _collect_targets() -> list[AirflowTarget]:
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "airflow_target" in metafunc.fixturenames:
         targets = _collect_targets()
-        metafunc.parametrize("airflow_target", targets, ids=[t.id for t in targets])
+        # Module scope: each Airflow version's tests share one container
+        metafunc.parametrize(
+            "airflow_target", targets, ids=[t.id for t in targets], scope="module"
+        )
 
 
 def _container_name(run_tag: str, target: AirflowTarget) -> str:
@@ -386,7 +417,7 @@ def _dump_diagnostics(container: str, run_id: str, task_states: bool) -> None:
         print(f"\nDiagnostics failed: {e!r}")
 
 
-def _dag_conf(config: SystemTestConfig) -> dict[str, Any]:
+def _dag_conf(config: SystemTestConfig, **overrides: Any) -> dict[str, Any]:
     """The example DAG's params, as a ``--conf`` payload."""
     return {
         "connection_id": CONNECTION_ID,
@@ -399,15 +430,159 @@ def _dag_conf(config: SystemTestConfig) -> dict[str, Any]:
         "poke_interval_seconds": config.poke_interval_seconds,
         "max_nodes": config.max_instances,
         "user_data": config.user_data or "",
+        "deferrable": False,
+        **overrides,
     }
 
 
-def test_example_dag_runs_to_success(
+def _normalise_yd_name(name: str) -> str:
+    """As the example DAG's ``_normalise_yd_name``."""
+    name = name.replace("/", "-").replace(" ", "_").replace(".", "_").lower()
+    name = re.sub("[^a-z0-9_-]", "", name).strip("-_")
+    if not name[:1].isalpha():
+        name = "x-" + name if name else "x"
+    return name[:60].rstrip("-_")
+
+
+def _dag_entity_name(prefix: str, run_id: str) -> str:
+    """As the example DAG's ``_get_entity_name``."""
+    return _normalise_yd_name(f"{prefix}-{run_id.replace('manual__', '')}")
+
+
+def dag_pool_name(run_id: str) -> str:
+    """The name the example DAG gives the worker pool (and its compute
+    requirement) of DAG run ``run_id``."""
+    return _dag_entity_name(f"wp-{DAG_ID}", run_id)
+
+
+def dag_first_wr_name(run_id: str) -> str:
+    """The name the example DAG gives the first work requirement of DAG run
+    ``run_id``."""
+    return _dag_entity_name("a-wr-airflow", run_id)
+
+
+def dag_run_tag_prefix(run_id: str) -> str:
+    """
+    The tag prefix of the work requirements of DAG run ``run_id`` (the
+    container sets no ``[yellowdog] deployment_id``).
+    """
+    return RunStamp(DAG_ID, run_id, "", -1).run_tag_prefix()
+
+
+def supports_trigger_kill(version: str | None) -> bool:
+    """Whether Airflow calls a trigger's ``on_kill`` (from Airflow 3.3)."""
+    if version is None:
+        return False
+    major_minor = tuple(int(part) for part in version.split(".")[:2])
+    return major_minor >= TRIGGER_KILL_MIN
+
+
+# A task in one of these states will not defer (again) in this DAG run
+TERMINAL_TASK_STATES = frozenset({"failed", "success", "upstream_failed", "skipped"})
+SETUP_TASK = "provision-worker-pool"
+
+
+def run_tasks_deferred(
+    states: dict[str, str], run_state: str | None, task_ids: list[str]
+) -> bool:
+    """
+    Whether all of ``task_ids`` are deferred. Raises AssertionError at once if
+    that can no longer happen: the DAG run has finished (``run_state`` is set),
+    the setup task ended without success, or one of the tasks reached a
+    terminal state.
+    """
+    if run_state is not None:
+        raise AssertionError(f"DAG run finished ({run_state}): {states}")
+    setup = states.get(SETUP_TASK)
+    if setup in TERMINAL_TASK_STATES and setup != "success":
+        raise AssertionError(f"Setup task {SETUP_TASK} {setup}: {states}")
+    ended = {t: states[t] for t in task_ids if states.get(t) in TERMINAL_TASK_STATES}
+    if ended:
+        raise AssertionError(f"Run tasks ended before deferring: {ended}: {states}")
+    return all(states.get(t) == "deferred" for t in task_ids)
+
+
+MAIN = "main"
+FAILURE = "fail"
+KILL = "kill"
+TRIGGER_KILL_MIN = (3, 3)
+# The triggerer notices a deleted trigger within its loop, and bounds on_kill
+# by [triggerer] on_kill_timeout (default 30 seconds)
+KILL_CANCEL_TIMEOUT_SECONDS = 180
+WR_CANCELLED = {WorkRequirementStatus.CANCELLING, WorkRequirementStatus.CANCELLED}
+# How long _assert_nothing_live waits for CANCELLING work requirements
+CANCELLING_GRACE_SECONDS = 60
+
+
+@dataclass
+class AirflowContainer:
+    """A running Airflow container with the example DAG unpaused."""
+
+    name: str
+    target: AirflowTarget
+    run_tag: str
+    config: SystemTestConfig
+    sweep_run_tag_prefixes: list[str]
+    sweep_name_fragments: list[str]
+    # The DAG run IDs triggered so far, by scenario
+    runs: dict[str, str] = field(default_factory=dict[str, str])
+
+    def run_id(self, scenario: str) -> str:
+        """
+        The DAG run ID for a scenario: ``<label>-<scenario>-<run tag>``. The
+        label and scenario come first so that pool names (shortened to 60
+        characters) differ across versions and scenarios; the names are
+        registered with the sweep, as they need not contain the whole run tag.
+        """
+        return f"{self.target.label}-{scenario}-{self.run_tag}"
+
+    def trigger(self, scenario: str, conf: dict[str, Any]) -> str:
+        """Trigger a DAG run, registering its resources with the sweep."""
+        run_id = self.run_id(scenario)
+        # Registered before triggering, so the sweep covers a partial run
+        self.sweep_run_tag_prefixes.append(dag_run_tag_prefix(run_id))
+        self.sweep_name_fragments.extend(
+            [dag_pool_name(run_id), dag_first_wr_name(run_id)]
+        )
+        proc = _airflow(
+            self.name,
+            "dags",
+            "trigger",
+            DAG_ID,
+            "--run-id",
+            run_id,
+            "--conf",
+            json.dumps(conf),
+        )
+        assert proc.returncode == 0, proc.stderr
+        self.runs[scenario] = run_id
+        return run_id
+
+    def wait_for_run(self, run_id: str) -> str:
+        """Wait until the DAG run finishes; return its state."""
+        return _poll(
+            lambda: _run_state(self.name, run_id),
+            4 * self.config.sensor_timeout_seconds,
+            f"DAG run '{run_id}' to finish",
+        )
+
+
+@pytest.fixture(scope="module")
+def airflow_container(
     system_config: SystemTestConfig,
     yd_client: PlatformClient,
     run_tag: str,
     airflow_target: AirflowTarget,
-) -> None:
+    sweep_run_tag_prefixes: list[str],
+    sweep_name_fragments: list[str],
+) -> Iterator[AirflowContainer]:
+    """
+    Start an Airflow container for ``airflow_target``, wait until the example
+    DAG is listed, unpause it, and trigger the main (deferrable) and failure
+    runs, which then run concurrently while the tests wait for them in turn.
+    The container is removed afterwards (unless kept for the UI). The
+    YellowDog sweep itself runs in the ``yd_client`` fixture teardown.
+    """
     if airflow_target.error is not None:
         pytest.fail(airflow_target.error)
     if not _docker_available():
@@ -416,10 +591,15 @@ def test_example_dag_runs_to_success(
     if airflow_target.error is not None:
         pytest.fail(airflow_target.error)
 
-    # The sweep itself runs in the yd_client fixture teardown; every container
-    # name and DAG run id (hence every YellowDog resource name) contains run_tag.
-    container = _container_name(run_tag, airflow_target)
-    run_id = f"{run_tag}-{airflow_target.label}"
+    container = AirflowContainer(
+        name=_container_name(run_tag, airflow_target),
+        target=airflow_target,
+        run_tag=run_tag,
+        config=system_config,
+        sweep_run_tag_prefixes=sweep_run_tag_prefixes,
+        sweep_name_fragments=sweep_name_fragments,
+    )
+    name = container.name
     ui_port = _target_ui_port(system_config.ui_port, airflow_target)
     image = airflow_target.image
     print(f"\n=== Airflow {airflow_target.label}: {airflow_target.version} ({image})")
@@ -432,8 +612,6 @@ def test_example_dag_runs_to_success(
         "YD_KEY_SECRET": system_config.key_secret,
     }
     started = False
-    # Task states still to print on failure (not yet printed by the test)
-    want_task_states = False
     try:
         pull = subprocess.run(
             ["docker", "pull", image], capture_output=True, text=True, timeout=900
@@ -445,7 +623,7 @@ def test_example_dag_runs_to_success(
                 "run",
                 "-d",
                 "--name",
-                container,
+                name,
                 *_ui_port_args(ui_port),
                 "-e",
                 "YD_CONSTRAINTS_URL",
@@ -475,50 +653,283 @@ def test_example_dag_runs_to_success(
         assert proc.returncode == 0, f"docker run failed: {proc.stderr}"
         started = True
         if ui_port is not None:
-            print(_ui_access_message(container, ui_port))
+            print(_ui_access_message(name, ui_port))
 
         try:
             _poll(
-                lambda: _container_ready(container),
+                lambda: _container_ready(name),
                 DAG_DISCOVERY_TIMEOUT_SECONDS,
                 f"DAG '{DAG_ID}' to be discovered",
             )
-            _check_versions(container, airflow_target)
-
-            unpause = _airflow(container, "dags", "unpause", DAG_ID)
+            _check_versions(name, airflow_target)
+            unpause = _airflow(name, "dags", "unpause", DAG_ID)
             assert unpause.returncode == 0, unpause.stderr
-            trigger = _airflow(
-                container,
-                "dags",
-                "trigger",
-                DAG_ID,
-                "--run-id",
-                run_id,
-                "--conf",
-                json.dumps(_dag_conf(system_config)),
-            )
-            assert trigger.returncode == 0, trigger.stderr
-            want_task_states = True
-
-            state = _poll(
-                lambda: _run_state(container, run_id),
-                4 * system_config.sensor_timeout_seconds,
-                f"DAG run '{run_id}' to finish",
-            )
-            tasks = _task_states(container, run_id)
-            want_task_states = False  # just printed
-            assert state == "success", f"DAG run finished in state '{state}'"
-            assert tasks, "No task states were reported for the DAG run"
-            bad = {t["task_id"]: t["state"] for t in tasks if t["state"] != "success"}
-            assert not bad, f"Tasks not successful: {bad}"
+            cfg = system_config
+            # The main run defers every wait; the failure run waits on workers
+            container.trigger(MAIN, _dag_conf(cfg, deferrable=True))
+            # Not triggered without failing task arguments (its test skips)
+            if cfg.failing_task_arguments is not None:
+                container.trigger(
+                    FAILURE,
+                    _dag_conf(cfg, task_arguments=list(cfg.failing_task_arguments)),
+                )
         except BaseException:
-            _dump_diagnostics(container, run_id, want_task_states)
+            _dump_diagnostics(name, "", task_states=False)
             raise
+        yield container
     finally:
         if _should_remove_container(ui_port, started):
-            _run(["docker", "rm", "-f", container])  # no-op if it doesn't exist
+            _run(["docker", "rm", "-f", name])  # no-op if it doesn't exist
         else:
-            print(
-                f"\nContainer {container} kept; remove it with:\n"
-                f"docker rm -f {container}"
+            print(f"\nContainer {name} kept; remove it with:\ndocker rm -f {name}")
+
+
+def _states_by_task(tasks: list[dict[str, Any]]) -> dict[str, str]:
+    return {str(t["task_id"]): str(t["state"]) for t in tasks}
+
+
+def _live_resources(
+    client: PlatformClient, namespace: str, run_id: str
+) -> tuple[list[str], list[str]]:
+    """
+    The run's unfinished resources: those still live, and its work
+    requirements that are CANCELLING (on their way to CANCELLED).
+    """
+    pool_name = dag_pool_name(run_id)
+    wrs = find_work_requirements(
+        client, namespace, dag_first_wr_name(run_id), [dag_run_tag_prefix(run_id)]
+    )
+    pools = find_worker_pools(client, namespace, pool_name)
+    crs = find_compute_requirements(client, namespace, pool_name)
+    cancelling = [
+        f"work requirement {w.id} ({w.name}, {w.status})"
+        for w in wrs
+        if w.status == WorkRequirementStatus.CANCELLING
+    ]
+    live = [
+        f"work requirement {w.id} ({w.name}, {w.status})"
+        for w in wrs
+        if w.status != WorkRequirementStatus.CANCELLING
+    ]
+    live += [f"worker pool {p.id} ({p.name}, {p.status})" for p in pools]
+    live += [f"compute requirement {c.id} ({c.name}, {c.status})" for c in crs]
+    return live, cancelling
+
+
+def _assert_nothing_live(client: PlatformClient, namespace: str, run_id: str) -> None:
+    """
+    No unfinished work requirement, pool or compute requirement of the run.
+    A CANCELLING work requirement (e.g. one whose running tasks are being
+    aborted) is waited for briefly, then accepted.
+    """
+    deadline = time.monotonic() + CANCELLING_GRACE_SECONDS
+    while True:
+        live, cancelling = _live_resources(client, namespace, run_id)
+        assert not live, f"Left live after DAG run '{run_id}': {live + cancelling}"
+        if not cancelling:
+            return
+        if time.monotonic() >= deadline:
+            print(f"\nStill cancelling after DAG run '{run_id}': {cancelling}")
+            return
+        time.sleep(5)
+
+
+def test_example_dag_runs_to_success(
+    airflow_container: AirflowContainer, yd_client: PlatformClient
+) -> None:
+    """The main run, deferring every wait to the triggerer, succeeds."""
+    container = airflow_container
+    run_id = container.runs[MAIN]
+    # Task states still to print on failure (not yet printed by the test)
+    want_task_states = True
+    try:
+        state = container.wait_for_run(run_id)
+        tasks = _task_states(container.name, run_id)
+        want_task_states = False  # just printed
+        assert state == "success", f"DAG run finished in state '{state}'"
+        assert tasks, "No task states were reported for the DAG run"
+        bad = {k: v for k, v in _states_by_task(tasks).items() if v != "success"}
+        assert not bad, f"Tasks not successful: {bad}"
+        _assert_nothing_live(yd_client, container.config.namespace, run_id)
+    except BaseException:
+        _dump_diagnostics(container.name, run_id, want_task_states)
+        raise
+
+
+def test_example_dag_failure_runs_teardown(
+    airflow_container: AirflowContainer, yd_client: PlatformClient
+) -> None:
+    """
+    A run whose work fails (its tasks exit non-zero; waits not deferred): the
+    run tasks and the DAG run fail, the teardown still succeeds, and nothing
+    of the run is left live.
+    """
+    container = airflow_container
+    task_arguments_or_skip(container.config, "failing_task_arguments")
+    run_id = container.runs[FAILURE]
+    want_task_states = True
+    try:
+        state = container.wait_for_run(run_id)
+        tasks = _states_by_task(_task_states(container.name, run_id))
+        want_task_states = False  # just printed
+        assert state == "failed", f"DAG run finished in state '{state}'"
+        assert tasks == {
+            "provision-worker-pool": "success",
+            "run-work-requirement-1": "failed",
+            "run-work-requirement-2": "failed",
+            "shutdown-worker-pool": "success",
+        }
+        _assert_nothing_live(yd_client, container.config.namespace, run_id)
+    except BaseException:
+        _dump_diagnostics(container.name, run_id, want_task_states)
+        raise
+
+
+# Runs in the container: marks a task instance failed through the REST API,
+# authenticating as the SimpleAuthManager's generated user, and prints the
+# HTTP status. Arguments: DAG ID, run ID, task ID.
+MARK_FAILED_SCRIPT = """
+import json, os, sys, urllib.parse, urllib.request
+from airflow.configuration import conf
+dag_id, run_id, task_id = sys.argv[1:4]
+path = conf.get("core", "simple_auth_manager_passwords_file", fallback=None) or (
+    os.path.join(os.environ.get("AIRFLOW_HOME", "/opt/airflow"),
+                 "simple_auth_manager_passwords.json.generated"))
+with open(path) as f:
+    username, password = next(iter(json.load(f).items()))
+base = "http://localhost:8080"
+request = urllib.request.Request(
+    base + "/auth/token",
+    data=json.dumps({"username": username, "password": password}).encode(),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=30) as response:
+    token = json.load(response)["access_token"]
+quote = lambda s: urllib.parse.quote(s, safe="")
+request = urllib.request.Request(
+    f"{base}/api/v2/dags/{quote(dag_id)}/dagRuns/{quote(run_id)}"
+    f"/taskInstances/{quote(task_id)}",
+    data=json.dumps({"new_state": "failed"}).encode(),
+    headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+    method="PATCH",
+)
+with urllib.request.urlopen(request, timeout=30) as response:
+    print(response.status)
+"""
+
+
+def _mark_failed(container: str, run_id: str, task_id: str) -> None:
+    proc = _run(
+        [
+            "docker",
+            "exec",
+            container,
+            "python",
+            "-c",
+            MARK_FAILED_SCRIPT,
+            DAG_ID,
+            run_id,
+            task_id,
+        ]
+    )
+    assert proc.returncode == 0, (
+        f"Marking {task_id} failed via the REST API failed:\n{proc.stdout}{proc.stderr}"
+    )
+    print(f"\nMarked {task_id} of '{run_id}' failed: HTTP {_last_line(proc.stdout)}")
+
+
+def _find_wr(
+    client: PlatformClient, namespace: str, name: str
+) -> tuple[str, WorkRequirementStatus | None] | None:
+    """The named work requirement's ID and status, or None if not found."""
+    try:
+        wr = client.work_client.get_work_requirement_by_name(namespace, name)
+    except Exception:
+        return None
+    return (str(wr.id), wr.status) if wr.id else None
+
+
+def _wr_cancelled(client: PlatformClient, wr_id: str) -> bool:
+    return client.work_client.get_work_requirement_by_id(wr_id).status in WR_CANCELLED
+
+
+def test_trigger_kill_cancels_deferred_work_requirement(
+    airflow_container: AirflowContainer, yd_client: PlatformClient
+) -> None:
+    """
+    Airflow 3.3 and later: marking a deferred ``RunWorkRequirement`` failed
+    makes the triggerer call the trigger's ``on_kill``, which cancels its
+    work requirement while the sibling task is still deferred (so it is not
+    the teardown's doing). The teardown then cleans up the rest.
+    """
+    container = airflow_container
+    if not supports_trigger_kill(container.target.version):
+        pytest.skip(
+            f"Airflow {container.target.version} has no kill hook for deferred "
+            "tasks (needs 3.3 or later)"
+        )
+    cfg = container.config
+    long_task_arguments = task_arguments_or_skip(cfg, "long_task_arguments")
+    run_id = container.trigger(
+        KILL,
+        _dag_conf(
+            cfg,
+            deferrable=True,
+            task_arguments=long_task_arguments,
+            # The work must outlast the check (it is cancelled by the test)
+            sensor_timeout_seconds=max(cfg.sensor_timeout_seconds, 1800),
+        ),
+    )
+    first, second = "run-work-requirement-1", "run-work-requirement-2"
+    wr_name = dag_first_wr_name(run_id)
+    want_task_states = True
+    try:
+
+        def both_deferred() -> bool:
+            proc = _airflow(
+                container.name,
+                "tasks",
+                "states-for-dag-run",
+                DAG_ID,
+                run_id,
+                "-o",
+                "json",
             )
+            try:
+                states = _states_by_task(list(_parse_json(proc.stdout)))
+            except ValueError:
+                return False
+            return run_tasks_deferred(
+                states, _run_state(container.name, run_id), [first, second]
+            )
+
+        _poll(both_deferred, 2 * cfg.sensor_timeout_seconds, "both run tasks to defer")
+        found = _find_wr(yd_client, cfg.namespace, wr_name)
+        assert found is not None, f"Work requirement '{wr_name}' not found"
+        wr_id, status = found
+        assert status is not None and not status.finished, status
+
+        _mark_failed(container.name, run_id, first)
+        _poll(
+            lambda: _wr_cancelled(yd_client, wr_id),
+            KILL_CANCEL_TIMEOUT_SECONDS,
+            f"work requirement {wr_id} to be cancelled by the trigger's on_kill",
+            interval=5,
+        )
+        # Not the teardown: that waits for the sibling, which is still deferred
+        states = _states_by_task(_task_states(container.name, run_id))
+        assert states.get(second) == "deferred", states
+        assert states.get("shutdown-worker-pool") not in ("running", "success"), states
+
+        # Finish the run: kill the sibling the same way; the teardown then runs
+        _mark_failed(container.name, run_id, second)
+        state = container.wait_for_run(run_id)
+        tasks = _states_by_task(_task_states(container.name, run_id))
+        want_task_states = False  # just printed
+        assert state == "failed", f"DAG run finished in state '{state}'"
+        assert tasks.get("shutdown-worker-pool") == "success", tasks
+        _assert_nothing_live(yd_client, cfg.namespace, run_id)
+    except BaseException:
+        _dump_diagnostics(container.name, run_id, want_task_states)
+        raise

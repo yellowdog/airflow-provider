@@ -4,6 +4,39 @@ Changelog
 2.0.0 (unreleased)
 ------------------
 
+New: provision, run, shut down
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A typical DAG is now three tasks: ``ProvisionWorkerPool(wait_until_ready=True)``
+as a setup task, the new ``RunWorkRequirement`` for the work, and
+``ShutdownProvisionedWorkerPool`` as the teardown. No sensors are needed. See
+:doc:`workflow`.
+
+- **RunWorkRequirement** submits a work requirement with its task groups and
+  tasks, and waits until it completes, failing if it fails or is cancelled.
+- **Deferral.** The waiting operators and the sensors take ``deferrable``
+  (default: Airflow's ``[operators] default_deferrable``) and can hand their
+  waits to Airflow's triggerer.
+- **Safe retries.** Submitted work requirements carry a run stamp; a retry
+  carries on with its earlier attempt instead of duplicating it or failing on
+  the name, and clearing a task runs its work again.
+- **Nothing left running.** Operators cancel their work requirement (aborting
+  running tasks) or terminate their unready pool when they time out, fail
+  while waiting, or are killed, or fail partway through a submission; the
+  teardown cancels any of the DAG run's work still running. This covers the
+  whole DAG run: set ``cancel_run_work_requirements=False`` on a teardown
+  when other pool scopes or other work run concurrently in the same DAG run
+  (for example a CPU pool and a GPU pool each with their own teardown), or
+  the first teardown aborts the other branch's work.
+
+New: YellowDog Portal links
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Operators and sensors that handle a work requirement or a worker pool show a
+*YellowDog work requirement* / *YellowDog worker pool* link to the YellowDog
+Portal. The Portal URL is derived from the connection's Platform API URL, or
+set with the connection's optional *Portal URL* field (see :doc:`connections`).
+
 Breaking changes (migrating from 1.x)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -139,6 +172,117 @@ To keep the 1.x behaviour (wait only for the target states), pass
 ``failure_states=[]``. Sensors whose targets include every final state (for
 example ``[SHUTDOWN, TERMINATED]`` for a worker pool) are unaffected.
 
+**AddWorkRequirement and AddPopulatedWorkRequirement are retry-safe, so a
+retry may return an existing work requirement or use a different name.**
+1.0.4 always added a new work requirement under the supplied name, so a retry
+(or a re-run after a clear) failed on the duplicate name, and a retry after a
+part-way failure of ``AddPopulatedWorkRequirement`` left the partly built work
+requirement behind. Now each submission is stamped with the DAG run and task
+(see :ref:`safe-retries`), and on a retry the operator:
+
+- returns this task's earlier work requirement's ID if it is unfinished
+  (``AddPopulatedWorkRequirement``: if it is also fully built; a partly built
+  one is cancelled, with abort, and replaced), or if it completed and the
+  task instance has not been cleared since;
+- otherwise submits a fresh copy named ``<name>-try<N>`` (``N`` being the
+  Airflow try number).
+
+A work requirement of the same name that another task or DAG run (or anyone
+else) submitted is never adopted or touched: a new one is added under
+``<name>-try<N>`` or ``<name>-<4 hex>-try<N>`` instead of failing. So the
+work requirement's name can differ from the one supplied; downstream tasks
+should use the ID from XCom.
+
+.. code-block:: python
+
+   # Before (1.0.4): look up the work requirement by its supplied name
+   AddTaskGroupsToWorkRequirement(
+       task_id="add-groups",
+       namespace="ns",
+       work_requirement_name="my-wr",
+       task_groups=groups,
+   )
+
+   # After (2.0.0): use the ID from XCom; the name may be "my-wr-try2"
+   AddTaskGroupsToWorkRequirement(
+       task_id="add-groups",
+       work_requirement_id="{{ ti.xcom_pull(task_ids='add-wr') }}",
+       task_groups=groups,
+   )
+
+**The work requirement's tag is replaced by the run stamp.**
+``RunWorkRequirement``, ``AddWorkRequirement`` and
+``AddPopulatedWorkRequirement`` set the submitted work requirement's ``tag``
+to ``airflow:<12 hex>:<12 hex>:c<cycle>``; a ``tag`` you set on the
+``WorkRequirement`` is overwritten (a warning is logged). 1.0.4 sent your tag
+unchanged. Record such information elsewhere, for example in the name.
+
+**An empty work requirement name is filled in.** With ``name=""`` (or no
+name) the submitting operators derive a name from the DAG, run and task IDs
+(see :ref:`safe-retries`); 1.0.4 sent it with the empty name unchanged.
+
+**Submitting operators need a task context.** 1.0.4 did not read the task
+instance from the context. Now ``AddWorkRequirement`` and
+``AddPopulatedWorkRequirement`` read it (``context["ti"]``) for the run
+stamp, so calling ``execute()`` directly (for example in a unit
+test) needs a context with a task instance; otherwise
+:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException`
+is raised.
+
+**Submitting operators cancel their work on kill.** If an
+``AddWorkRequirement`` or ``AddPopulatedWorkRequirement`` task is killed
+while it runs, its work requirement is cancelled, aborting running tasks
+(best effort). 1.0.4 left it running.
+
+**ShutdownProvisionedWorkerPool first cancels the DAG run's unfinished work
+requirements.** By default (``cancel_run_work_requirements=True``), before
+shutting the pool down it cancels, with abort, every unfinished work
+requirement submitted by any task of the same DAG run, in every namespace the
+credentials can see (recognised by the run stamp; other runs' work and work
+not submitted by the provider are never touched). 1.0.4 only shut the pool
+down. If several Airflow environments share a YellowDog account, set
+``[yellowdog] deployment_id`` in each (see :ref:`deployment-id`).
+
+.. code-block:: python
+
+   # Before (1.0.4): shut down the pool; work requirements kept running
+   ShutdownProvisionedWorkerPool(task_id="shutdown", worker_pool_id=pool_id)
+
+   # After (2.0.0): to keep that behaviour, opt out
+   ShutdownProvisionedWorkerPool(
+       task_id="shutdown",
+       worker_pool_id=pool_id,
+       cancel_run_work_requirements=False,
+   )
+
+**ShutdownProvisionedWorkerPool succeeds if the pool is already shut down.**
+A pool that is already shut down, or a compute requirement that is already
+terminating or terminated, is treated as success (1.0.4 failed with the
+platform's "invalid transition" error). With ``terminate_immediately=True``,
+the compute requirement is now terminated even if the pool's shutdown fails
+for another reason; the task then fails with the shutdown error (1.0.4 did not
+try to terminate).
+
+**default_deferrable applies to the provider's sensors.** The sensors now
+support deferrable mode, and ``deferrable`` defaults to Airflow's
+``[operators] default_deferrable`` setting. If your Airflow sets it to
+``True``, the sensors now defer, which needs a running triggerer; pass
+``deferrable=False`` to keep them polling. In deferrable mode
+``mode="reschedule"`` is ignored, ``silent_fail`` has no effect, and a
+timeout with ``never_fail=True`` skips the task (see :doc:`sensors`).
+
+**Example DAGs have the three-task shape.** ``yd-provider-test.py`` is now
+``provision-worker-pool`` (``ProvisionWorkerPool`` with
+``wait_until_ready=True``, a setup task) followed by two
+``RunWorkRequirement`` tasks and ``shutdown-worker-pool`` (the teardown,
+which takes the pool's ID from XCom); its step-by-step operators, sensors and
+``ALL_DONE`` clean-up tasks are gone. Its ``sensor_timeout_seconds`` and ``poke_interval_seconds`` params now
+set the waiting operators' ``timeout`` and ``poke_interval``; a new
+``deferrable`` param (default ``false``) sets their ``deferrable``; and the
+pool is named ``wp-<dag_id>-<run_id>``. ``yd-quickstart.py`` runs one
+``RunWorkRequirement`` instead of submitting and then waiting with a sensor.
+DAGs copied from the 1.x examples keep working, but see the entries above.
+
 **Type stub files (.pyi) are no longer shipped.** Annotations are inline and
 the package ships ``py.typed``; it is checked with pyright (strict) and
 ``pyright --verifytypes``.
@@ -146,11 +290,58 @@ the package ships ``py.typed``; it is checked with pyright (strict) and
 Added
 ~~~~~
 
+* :class:`~yellowdog_provider.operators.yellowdog_operators.RunWorkRequirement`:
+  submit a work requirement with its task groups and tasks, and wait for it
+  (``target_states``, ``failure_states``, ``poke_interval``, ``timeout``,
+  ``deferrable``); see :doc:`operators`.
+* ``ProvisionWorkerPool`` arguments ``wait_until_ready`` (default ``False``,
+  the 1.x behaviour), ``poke_interval``, ``timeout`` and ``deferrable``: wait
+  until the pool is ``IDLE`` or ``RUNNING``, shutting the pool down if it
+  never becomes ready.
+* ``ShutdownProvisionedWorkerPool`` arguments ``wait`` (default ``False``),
+  ``poke_interval``, ``timeout``, ``deferrable`` and
+  ``cancel_run_work_requirements`` (default ``True``; see above).
+* ``deferrable`` on the three sensors, and
+  :class:`~yellowdog_provider.triggers.yellowdog_triggers.YellowDogStateTrigger`,
+  the trigger behind all deferred waits. On Airflow 3.3 and later (verified on
+  3.4), a deferred ``RunWorkRequirement`` or ``ProvisionWorkerPool`` killed by
+  a user is cleaned up by the trigger; Airflow 3.1 and 3.2 have no kill hook
+  for deferred tasks (see :ref:`cancellation`).
+* Waits tolerate up to three consecutive transient errors (connection
+  errors, timeouts, HTTP 429 and 5xx, and the SDK's server errors); see
+  :ref:`transient-errors`.
+* :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.WaitTimeoutError`,
+  raised when an operator's own wait times out (retried by Airflow, unlike
+  ``YellowDogStateError``).
+* Hook operations for use from TaskFlow: ``get_work_requirement_state``,
+  ``get_worker_pool_state``, ``get_compute_requirement_state``,
+  ``submit_work_requirement``, ``add_work_requirement``,
+  ``cancel_work_requirement``, ``find_unfinished_run_work_requirements``,
+  ``provision_worker_pool``, ``shutdown_worker_pool``,
+  ``terminate_compute_requirement`` and ``portal_base_url``, with
+  :class:`~yellowdog_provider.hooks.yellowdog_hooks.SubmitResult`; and the
+  utilities ``yellowdog_provider.utils.run_stamp`` (``RunStamp``,
+  ``derive_name``, ``try_name``) and ``yellowdog_provider.utils.waiting``
+  (``wait_for_state``, ``resolve_states``, ``is_transient_error``). See
+  :doc:`taskflow`.
+* The Airflow setting ``[yellowdog] deployment_id``
+  (``AIRFLOW__YELLOWDOG__DEPLOYMENT_ID``), to tell apart Airflow environments
+  that share a YellowDog account; see :ref:`deployment-id`.
+* The submitting operators (``RunWorkRequirement``, ``AddWorkRequirement``,
+  ``AddPopulatedWorkRequirement``) submit deep copies, so your
+  ``WorkRequirement``, ``TaskGroup`` and ``Task`` objects are never modified:
+  the run stamp and any generated name are applied to the copies.
+* The connection's optional *Portal URL* field, and the *YellowDog work
+  requirement* and *YellowDog worker pool* task links.
 * A default connection ID, ``yellowdog_default``, used by the hook, operators
   and sensors when ``connection_id`` is not given.
 * ``YellowDogHook.test_connection`` so that **Test** works in the Airflow
   connection UI, and context-manager support (``with YellowDogHook(...)``)
   that closes the client afterwards.
+* ``YellowDogHook(..., connection=...)``: a hook can use an already fetched
+  Airflow connection instead of looking it up (the trigger fetches the
+  connection asynchronously in the triggerer's event loop and passes it to the
+  hooks it uses in worker threads).
 * ``TemplateCallable`` and ``Templated``, typed helpers for templated fields
   that may be supplied as callables (``yellowdog_provider.utils.templating``).
 * :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError` (``yellowdog_provider.exceptions``).
@@ -164,17 +355,20 @@ Added
   connection type.
 * Complete type annotations, validated in CI.
 * Example DAGs: ``yd-quickstart.py`` and a params-driven ``yd-provider-test.py``
-  (connection, namespace, compute requirement template, image family, and an
-  optional ``user_data`` parameter for instance userdata).
-* Restructured documentation: concepts, quick start, connections, templating
-  and troubleshooting pages, and API signatures in the reference.
+  (connection, namespace, compute requirement template, image family, task
+  type and arguments, timeout, poke interval, ``deferrable``, maximum nodes,
+  and an optional ``user_data`` parameter for instance userdata).
+* Restructured documentation: concepts, quick start, the three-task workflow,
+  step-by-step and TaskFlow pages, connections, templating and
+  troubleshooting pages, and API signatures in the reference.
 
 Fixed
 ~~~~~
 
-* ``AddPopulatedWorkRequirement`` now creates task groups in the order given.
-  1.0.4 reversed the list before submitting it, so groups were created in
-  reverse order.
+* ``AddPopulatedWorkRequirement`` now submits task groups in the order given.
+  1.0.4 reversed the list before submitting it, to work around a platform bug
+  that reversed task-group order; the platform now preserves the order, so
+  with 1.0.4 groups would be created in reverse order.
 * ``AddTaskGroupsToWorkRequirement`` returns the new task group IDs in the
   same order as the ``task_groups`` argument (previously in platform order).
 * The hook's ``conn_name_attr`` is now ``connection_id``, matching the hook's

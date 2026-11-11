@@ -1,9 +1,12 @@
 Quick start
 ===========
 
-This walk-through runs one task on YellowDog from an Airflow DAG: it submits
-a work requirement containing a single ``docker`` task that runs the
-``hello-world`` container, then waits for the work requirement to complete.
+This walk-through runs a DAG with a single Airflow task,
+:class:`~yellowdog_provider.operators.yellowdog_operators.RunWorkRequirement`,
+on a YellowDog worker pool that is already running. The Airflow task submits
+a work requirement containing one YellowDog task (a ``docker`` task that runs
+the ``hello-world`` container), then waits until the work requirement
+completes. To provision the pool from the DAG as well, see :doc:`workflow`.
 
 .. contents:: On this page
    :local:
@@ -105,22 +108,20 @@ also shipped in the package, as
 What it does:
 
 - ``make_work_requirement`` and ``make_groups_and_tasks`` are *callables*.
-  Airflow calls them when the ``submit`` task runs, passing the run's
+  Airflow calls them when the ``run`` task runs, passing the run's
   context, so they can use the run's params and ``run_id`` (see
   :doc:`templating`). The work requirement's name includes the ``run_id``,
   so every run creates a uniquely named work requirement.
 - The task group's run specification asks for the ``docker`` task type and
   your worker tag, so only your pool's workers will claim it.
-- ``submit``
-  (:class:`~yellowdog_provider.operators.yellowdog_operators.AddPopulatedWorkRequirement`)
-  creates the work requirement, its task group and task, and returns the
-  work requirement's ID, which Airflow stores as the task's XCom.
-- ``wait``
-  (:class:`~yellowdog_provider.sensors.yellowdog_sensors.WorkRequirementStateSensor`)
-  pulls that ID from XCom and checks the work requirement's status every 30
-  seconds, for up to 30 minutes, until it is ``COMPLETED``. If the work
-  requirement reaches ``FAILED`` or ``CANCELLED`` instead, the sensor fails
-  at once with :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError` (see :ref:`failure states <failure-states>`).
+- ``run``
+  (:class:`~yellowdog_provider.operators.yellowdog_operators.RunWorkRequirement`)
+  creates the work requirement, its task group and task, then checks the work
+  requirement's status every 30 seconds, for up to 30 minutes, until it is
+  ``COMPLETED``. If the work requirement reaches ``FAILED`` or ``CANCELLED``
+  instead, the task fails at once with :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError`
+  (see :ref:`failure states <failure-states>`). If the wait times out or the
+  task is killed, the work requirement is cancelled.
 
 5. Trigger a run
 ----------------
@@ -140,15 +141,18 @@ the params in the form.
 What to expect
 --------------
 
-- ``submit`` succeeds within a few seconds. Its log shows the work
-  requirement's namespace and name, then ``Added work requirement ID '...'``.
-  The new work requirement is visible in the YellowDog Portal.
-- ``wait`` logs the status on each poke (``Current status is 'RUNNING' ...``)
-  until the task has run. On a pool that is already up, ``hello-world``
-  finishes quickly, so the sensor usually succeeds within a few pokes.
-- When the work requirement completes, ``wait`` logs ``... has reached
-  status 'COMPLETED'`` and succeeds, and so does the DAG run.
-- If the work fails or is cancelled, ``wait`` fails with
+- ``run`` logs the work requirement's namespace and name and, a few seconds
+  after it starts, its ID (``Work requirement '<namespace>/<name>' (ID
+  '...'): submitted``). The new work requirement is visible in the YellowDog
+  Portal, and once the task has finished the task's *YellowDog work
+  requirement* link opens it (see :doc:`connections`).
+- ``run`` logs the status on each check (``Current status is 'RUNNING' ...
+  waiting for 30 seconds``) until the task has run. On a pool that is already
+  up, ``hello-world`` finishes quickly, so the task usually succeeds within a
+  few checks.
+- When the work requirement completes, ``run`` logs ``Reached status
+  'COMPLETED'`` and succeeds, and so does the DAG run.
+- If the work fails or is cancelled, ``run`` fails with
   :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError` (for example ``Work requirement
   'airflow-quickstart/quickstart-...' (ID '...') reached status 'FAILED',
   which is a failure state (target states: 'COMPLETED')``), and the DAG run
@@ -156,21 +160,22 @@ What to expect
   wait for the work to finish whatever the outcome, list ``FAILED`` and
   ``CANCELLED`` in ``target_states`` too.
 
-If ``wait`` keeps reporting ``RUNNING``, no worker has claimed the task: check
+If ``run`` keeps reporting ``RUNNING``, no worker has claimed the task: check
 that your pool is up, supports the ``docker`` task type, and carries exactly
 the worker tag you passed. See :doc:`troubleshooting` for other problems.
 
 Next steps
 ----------
 
+- :doc:`workflow` shows the usual three-task DAG (provision a pool, run work
+  on it, shut it down) and explains deferral, retries and clean-up.
 - :doc:`operators` and :doc:`sensors` describe every class and argument.
 - :doc:`templating` explains callables and XCom-to-ID patterns.
 - The package's full example DAG,
-  ``yellowdog_provider/example_dags/yd-provider-test.py``, exercises every
-  operator and sensor: it provisions its own worker pool, submits work in
-  several ways, waits for it, and tears everything down with ``ALL_DONE``
-  trigger rules. Its behaviour is driven by DAG params (connection ID,
+  ``yellowdog_provider/example_dags/yd-provider-test.py``, exercises the
+  workflow operators: it provisions its own worker pool (a setup task), runs
+  two work requirements on it, and shuts it down (a teardown task). Its behaviour is driven by DAG params (connection ID,
   namespace, compute requirement template, image family, task type and
-  arguments, sensor timeout and poke interval, maximum worker pool nodes,
-  userdata), whose defaults must be changed to match items in your YellowDog
+  arguments, timeout and poke interval, whether to defer, maximum worker pool
+  nodes, userdata), whose defaults must be changed to match items in your YellowDog
   account.

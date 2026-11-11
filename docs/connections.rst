@@ -36,12 +36,16 @@ Connection fields
    * - Application Key Secret
      - ``password``
      - Required. The key secret of the same Application.
+   * - Portal URL
+     - ``extra`` (``portal_url``)
+     - Optional. The base URL of the YellowDog Portal, used for the *YellowDog
+       work requirement* and *YellowDog worker pool* task links. See below.
    * - Description
      - ``description``
      - Optional free text, for example the purpose and scope of the
        Application.
 
-The *schema*, *port* and *extra* fields are not used and are hidden in the UI.
+The *schema* and *port* fields are not used and are hidden in the UI.
 
 **Platform API URL.** The URL is normalised before use:
 
@@ -51,6 +55,28 @@ The *schema*, *port* and *extra* fields are not used and are hidden in the UI.
 
 When a URL other than the default is used, the hook logs ``Using Platform API
 URL: ...`` in the task log.
+
+**Portal URL.** Task links to the YellowDog Portal
+(``https://portal.yellowdog.ai/#/work/<id>`` and ``.../#/workers/<id>``) use
+the *Portal URL* if set (``https://`` is assumed if it has no scheme). Otherwise the Portal URL is the Platform API URL with
+a leading ``api.`` host label replaced by ``portal.`` (for example
+``https://api.yellowdog.ai`` gives ``https://portal.yellowdog.ai``). If the
+Platform API host does not start with ``api.`` and no *Portal URL* is set, no
+link is shown. In Airflow 3.1 the field appears in the UI only where the
+Flask-AppBuilder libraries are installed; elsewhere set it in the connection's
+JSON ``extra`` as ``{"portal_url": "https://..."}``.
+
+**Portal links.** The *YellowDog work requirement* link appears on
+``RunWorkRequirement``, ``AddWorkRequirement``, ``AddPopulatedWorkRequirement``
+and ``WorkRequirementStateSensor`` tasks, and the *YellowDog worker pool* link
+on ``ProvisionWorkerPool``, ``ShutdownProvisionedWorkerPool`` and
+``WorkerPoolStateSensor`` tasks, in the task instance's details in the
+Airflow UI. Each points at the resource whose ID the task pushed to XCom.
+Airflow's worker computes a task's links when the task finishes or defers,
+and stores them in XCom, so a link appears once the task has finished or
+deferred: not while it is still polling on a worker (use ``deferrable=True``
+to see the link during a long wait). No link is shown if the task pushed no
+ID, the Portal URL cannot be worked out, or the connection cannot be read.
 
 Creating a connection
 ---------------------
@@ -130,6 +156,16 @@ on the connection in the UI, or:
 A missing key ID or secret is reported as ``Connection '<id>' has no
 Application Key ID`` (or ``Application Key Secret``).
 
+Several Airflow environments sharing an account
+------------------------------------------------
+
+If two or more Airflow environments (for example staging and production)
+use credentials for the same YellowDog account, set a different
+``[yellowdog] deployment_id`` (environment variable
+``AIRFLOW__YELLOWDOG__DEPLOYMENT_ID``) in each. Otherwise runs with the same
+DAG and run IDs in the two environments cannot be told apart, and one
+environment's teardown can cancel the other's work. See :ref:`deployment-id`.
+
 Using the hook directly
 -----------------------
 
@@ -155,6 +191,9 @@ closed afterwards::
            if wr.status != WorkRequirementStatus.COMPLETED:
                raise RuntimeError(f"Work requirement ended as {wr.status}")
            return wr.status.value
+
+The hook also has typed methods for the operations the operators perform
+(submit, wait, cancel, provision, shut down); see :doc:`taskflow`.
 
 The hook takes ``connection_id`` (default ``yellowdog_default``) plus standard
 hook keyword arguments. ``get_conn()`` raises

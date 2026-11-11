@@ -39,20 +39,20 @@ TASK_NAME = "task_1"
 TASK_TYPE = "docker"  # Param: task_type
 TASK_ARGS = ["hello-world"]  # Param: task_arguments
 FIRST_WR_PREFIX = "a-"
-SECOND_WR_PREFIX = "b-"
-SECOND_WR_NUM_ADDED_TASK_GROUPS = 2
-SECOND_WR_NUM_ADDED_TASKS = 2
 
-# Polling interval and timeout for sensors. A sensor's `poke_interval` and
-# `timeout` are fixed when the DAG is parsed and cannot be templated, so the
-# sensors start with these values and `_apply_sensor_params` replaces them with
-# the run's `poke_interval_seconds` and `sensor_timeout_seconds` params just
-# before each sensor executes. The hook updates `context["ti"].task`, the task
-# object actually executing: Airflow 3.1 runs a copy of the task
+# Polling interval and timeout for the tasks that wait (provisioning the pool,
+# running work, shutting the pool down), and whether they defer to the
+# triggerer while waiting. These are `__init__` arguments of the operators, not
+# templated, so the tasks start with these values and `_apply_run_params`
+# replaces them with the run's `poke_interval_seconds`, `sensor_timeout_seconds`
+# and `deferrable` params just before each task executes (the operators decide
+# whether to defer at execute time). The hook updates `context["ti"].task`, the
+# task object actually executing: Airflow 3.1 runs a copy of the task
 # (`prepare_for_execution()`) while `context["task"]` still refers to the
 # original, so changing `context["task"]` would have no effect there.
 POKE_INTERVAL_SECONDS = 10.0  # Param: poke_interval_seconds
 SENSOR_TIMEOUT_SECONDS = 300.0  # Param: sensor_timeout_seconds
+DEFERRABLE = False  # Param: deferrable
 
 # The name of the DAG in Airflow
 DAG_ID = "yellowdog-provider-test"
@@ -66,9 +66,7 @@ from typing import Any, cast
 
 from airflow.sdk import (
     BaseOperator,
-    BaseSensorOperator,
     Context,
-    TriggerRule,
     dag,  # pyright: ignore[reportUnknownVariableType]  # Airflow's @dag overloads are partially untyped
 )
 from airflow.sdk.types import RuntimeTaskInstanceProtocol
@@ -76,7 +74,6 @@ from jinja2 import Environment
 from yellowdog_client.common import SearchClient
 from yellowdog_client.model import (
     AutoShutdown,
-    ComputeRequirementStatus,
     ComputeRequirementTemplateUsage,
     MachineImageFamilySearch,
     MachineImageFamilySummary,
@@ -86,7 +83,6 @@ from yellowdog_client.model import (
     RunSpecification,
     Task,
     TaskGroup,
-    WorkerPoolStatus,
     WorkRequirement,
     WorkRequirementStatus,
 )
@@ -94,18 +90,9 @@ from yellowdog_client.model import (
 from yellowdog_provider.exceptions.yellowdog_exceptions import YellowDogArgumentError
 from yellowdog_provider.hooks.yellowdog_hooks import YellowDogHook
 from yellowdog_provider.operators.yellowdog_operators import (
-    AddPopulatedWorkRequirement,
-    AddTaskGroupsToWorkRequirement,
-    AddTasksToTaskGroup,
-    AddWorkRequirement,
-    CancelWorkRequirement,
     ProvisionWorkerPool,
+    RunWorkRequirement,
     ShutdownProvisionedWorkerPool,
-)
-from yellowdog_provider.sensors.yellowdog_sensors import (
-    ComputeRequirementStateSensor,
-    WorkerPoolStateSensor,
-    WorkRequirementStateSensor,
 )
 
 ###############################################################################
@@ -125,166 +112,69 @@ from yellowdog_provider.sensors.yellowdog_sensors import (
         "poke_interval_seconds": POKE_INTERVAL_SECONDS,
         "max_nodes": MAX_NODES,
         "user_data": USER_DATA,
+        "deferrable": DEFERRABLE,
     },
 )
 def yd_provider_test():
 
-    # Instantiate operators and sensors
-
+    # Setup: provision the worker pool and wait until it is ready. As a setup
+    # task, its teardown below runs however the work tasks end. If this task
+    # itself fails, it shuts down its own pool, and Airflow does not run the
+    # teardown.
     provision_worker_pool = ProvisionWorkerPool(
         task_id="provision-worker-pool",
         connection_id="{{ params.connection_id }}",
         compute_requirement_template_usage=gen_crtu,
         provisioned_worker_pool_properties=gen_pwpp,
-    )
+        wait_until_ready=True,
+        poke_interval=POKE_INTERVAL_SECONDS,
+        timeout=SENSOR_TIMEOUT_SECONDS,
+        pre_execute=_apply_run_params,
+    ).as_setup()
 
-    add_work_requirement = AddWorkRequirement(
-        task_id="add-work-requirement",
+    # Work: two work requirements, running on the pool in parallel. The first
+    # is named explicitly; the second leaves its name empty, so it is named
+    # after the DAG, task and run.
+    run_work_requirement_1 = RunWorkRequirement(
+        task_id="run-work-requirement-1",
         connection_id="{{ params.connection_id }}",
         work_requirement=gen_work_requirement_1,
+        task_groups_and_tasks=gen_task_groups_and_tasks,
+        # Fails at once if the work requirement fails or is cancelled
+        target_states=[WorkRequirementStatus.COMPLETED],
+        poke_interval=POKE_INTERVAL_SECONDS,
+        timeout=SENSOR_TIMEOUT_SECONDS,
+        pre_execute=_apply_run_params,
     )
 
-    add_task_groups_to_work_requirement = AddTaskGroupsToWorkRequirement(
-        task_id="add-task-groups-to-work-requirement",
-        connection_id="{{ params.connection_id }}",
-        work_requirement_id="{{ ti.xcom_pull(task_ids='add-work-requirement') }}",
-        task_groups=gen_task_groups,
-    )
-
-    add_tasks_to_task_group_1 = AddTasksToTaskGroup(
-        task_id="add-tasks-to-task-group-1",
-        connection_id="{{ params.connection_id }}",
-        namespace=gen_namespace,
-        work_requirement_name=gen_wr_name_1,
-        task_group_name="task-group-1",
-        tasks=gen_tasks,
-    )
-
-    add_tasks_to_task_group_2 = AddTasksToTaskGroup(
-        task_id="add-tasks-to-task-group-2",
-        connection_id="{{ params.connection_id }}",
-        namespace=gen_namespace,
-        work_requirement_name=gen_wr_name_1,
-        task_group_name="task-group-2",
-        tasks=gen_tasks,
-    )
-
-    add_populated_work_requirement = AddPopulatedWorkRequirement(
-        task_id="add-populated-work-requirement",
+    run_work_requirement_2 = RunWorkRequirement(
+        task_id="run-work-requirement-2",
         connection_id="{{ params.connection_id }}",
         work_requirement=gen_work_requirement_2,
         task_groups_and_tasks=gen_task_groups_and_tasks,
-    )
-
-    wait_for_work_requirement_1_to_finish = WorkRequirementStateSensor(
-        task_id="wait-for-work-requirement-1-to-finish",
-        connection_id="{{ params.connection_id }}",
-        work_requirement_id="{{ ti.xcom_pull(task_ids='add-work-requirement') }}",
-        # Fails at once if the work requirement fails or is cancelled
         target_states=[WorkRequirementStatus.COMPLETED],
         poke_interval=POKE_INTERVAL_SECONDS,
         timeout=SENSOR_TIMEOUT_SECONDS,
-        pre_execute=_apply_sensor_params,
+        pre_execute=_apply_run_params,
     )
 
-    wait_for_work_requirement_2_to_finish = WorkRequirementStateSensor(
-        task_id="wait-for-work-requirement-2-to-finish",
-        connection_id="{{ params.connection_id }}",
-        namespace=gen_namespace,
-        work_requirement_name=gen_wr_name_2,
-        # Fails at once if the work requirement fails or is cancelled
-        target_states=[WorkRequirementStatus.COMPLETED],
-        poke_interval=POKE_INTERVAL_SECONDS,
-        timeout=SENSOR_TIMEOUT_SECONDS,
-        pre_execute=_apply_sensor_params,
-    )
-
+    # Teardown: always runs once the work is done, however it ended. It also
+    # cancels the run's unfinished work requirements, and waits for the pool
+    # and its compute requirement to terminate.
     shut_down_worker_pool = ShutdownProvisionedWorkerPool(
         task_id="shutdown-worker-pool",
         connection_id="{{ params.connection_id }}",
+        # The pool's ID, not its name: a name could match another run's pool
         worker_pool_id="{{ ti.xcom_pull(task_ids='provision-worker-pool') }}",
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-
-    terminate_worker_pool = ShutdownProvisionedWorkerPool(
-        task_id="terminate-worker-pool",
-        connection_id="{{ params.connection_id }}",
-        namespace=gen_namespace,
-        worker_pool_name=gen_wp_name,
         terminate_immediately=True,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-
-    wait_for_worker_pool_to_shut_down = WorkerPoolStateSensor(
-        task_id="wait-for-worker-pool-to-shut-down",
-        connection_id="{{ params.connection_id }}",
-        worker_pool_id="{{ ti.xcom_pull(task_ids='provision-worker-pool') }}",
-        target_states=[WorkerPoolStatus.SHUTDOWN, WorkerPoolStatus.TERMINATED],
+        wait=True,
         poke_interval=POKE_INTERVAL_SECONDS,
         timeout=SENSOR_TIMEOUT_SECONDS,
-        pre_execute=_apply_sensor_params,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
+        pre_execute=_apply_run_params,
+    ).as_teardown(setups=provision_worker_pool)
 
-    wait_for_compute_requirement_to_terminate = ComputeRequirementStateSensor(
-        task_id="wait-for-compute-requirement-to-terminate",
-        connection_id="{{ params.connection_id }}",
-        namespace=gen_namespace,
-        compute_requirement_name=gen_wp_name,
-        target_states=[
-            ComputeRequirementStatus.TERMINATED,
-        ],
-        poke_interval=POKE_INTERVAL_SECONDS,
-        timeout=SENSOR_TIMEOUT_SECONDS,
-        pre_execute=_apply_sensor_params,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-
-    cancel_work_requirement_1 = CancelWorkRequirement(
-        task_id="cancel-work-requirement-1",
-        connection_id="{{ params.connection_id }}",
-        work_requirement_id="{{ ti.xcom_pull(task_ids='add-work-requirement') }}",
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-
-    cancel_work_requirement_2 = CancelWorkRequirement(
-        task_id="cancel-work-requirement-2",
-        connection_id="{{ params.connection_id }}",
-        namespace=gen_namespace,
-        work_requirement_name=gen_wr_name_2,
-        abort_running_tasks=True,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-
-    # # Establish Airflow DAG task dependencies
-    # # Note: not intended to be realistic; this is just to exercise all the YellowDog classes
-
-    _ = (
-        provision_worker_pool
-        >> add_work_requirement
-        >> add_task_groups_to_work_requirement
-        >> add_tasks_to_task_group_1
-        >> add_tasks_to_task_group_2
-        >> wait_for_work_requirement_1_to_finish
-        >> shut_down_worker_pool
-    )
-
-    _ = (
-        provision_worker_pool
-        >> add_populated_work_requirement
-        >> wait_for_work_requirement_2_to_finish
-        >> shut_down_worker_pool
-    )
-
-    _ = (
-        shut_down_worker_pool
-        >> wait_for_worker_pool_to_shut_down
-        >> terminate_worker_pool
-        >> wait_for_compute_requirement_to_terminate
-    )
-
-    _ = shut_down_worker_pool >> cancel_work_requirement_1
-    _ = shut_down_worker_pool >> cancel_work_requirement_2
+    _ = provision_worker_pool >> [run_work_requirement_1, run_work_requirement_2]
+    _ = [run_work_requirement_1, run_work_requirement_2] >> shut_down_worker_pool
 
 
 ###############################################################################
@@ -314,7 +204,7 @@ def gen_work_requirement_1(context: Context, jinja_env: Environment) -> WorkRequ
 def gen_work_requirement_2(context: Context, jinja_env: Environment) -> WorkRequirement:
     return WorkRequirement(
         namespace=gen_namespace(context, Environment()),
-        name=_get_wr_name(context, SECOND_WR_PREFIX),
+        name="",  # Left empty: named automatically after the DAG, task and run
     )
 
 
@@ -348,6 +238,10 @@ def gen_pwpp(
         createNodeWorkers=NodeWorkerTarget(
             targetCount=1, targetType=NodeWorkerTargetType.PER_VCPU
         ),
+        # Safety net: if a deferred setup task is killed on Airflow 3.1 or 3.2
+        # (no kill hook for deferred tasks), or its worker crashes while it
+        # waits, nothing else shuts the pool down, so
+        # the pool and its nodes shut themselves down when idle.
         idleNodeShutdown=AutoShutdown(
             enabled=True, timeout=timedelta(minutes=NODE_SHUTDOWN_TIMER_MINUTES)
         ),
@@ -358,39 +252,6 @@ def gen_pwpp(
         maxNodes=max_nodes,
         workerTag=_get_worker_tag(context),
     )
-
-
-def gen_wr_name_1(context: Context, jinja_env: Environment) -> str:
-    return _get_wr_name(context, FIRST_WR_PREFIX)
-
-
-def gen_wr_name_2(context: Context, jinja_env: Environment) -> str:
-    return _get_wr_name(context, SECOND_WR_PREFIX)
-
-
-def gen_wp_name(context: Context, jinja_env: Environment) -> str:
-    return _get_wp_name(context)
-
-
-def gen_task_groups(context: Context, jinja_env: Environment) -> list[TaskGroup]:
-    run_specification = RunSpecification(
-        taskTypes=[_params(context)["task_type"]], workerTags=[_get_worker_tag(context)]
-    )
-    return [
-        TaskGroup(name=f"task-group-{x}", runSpecification=run_specification)
-        for x in range(1, SECOND_WR_NUM_ADDED_TASK_GROUPS + 1)
-    ]
-
-
-def gen_tasks(context: Context, jinja_env: Environment) -> list[Task]:
-    return [
-        Task(
-            name=f"task-{x}",
-            taskType=_params(context)["task_type"],
-            arguments=_params(context)["task_arguments"],
-        )
-        for x in range(1, SECOND_WR_NUM_ADDED_TASKS + 1)
-    ]
 
 
 def gen_task_groups_and_tasks(
@@ -462,17 +323,26 @@ def _number_param(name: str, raw: Any) -> float:
         ) from None
 
 
-def _apply_sensor_params(context: Context) -> None:
+def _apply_run_params(context: Context) -> None:
     """
-    Sensor `pre_execute` hook: take the sensor's timeout and poke interval from
-    the run's params.
+    `pre_execute` hook: take the task's timeout, poke interval and deferrable
+    setting from the run's params.
     """
     # ti.task, not context["task"]: see the note above SENSOR_TIMEOUT_SECONDS
-    sensor = cast("dict[str, Any]", context)["ti"].task
-    assert isinstance(sensor, BaseSensorOperator)
+    task = cast("dict[str, Any]", context)["ti"].task
+    assert isinstance(task, BaseOperator)
     params = _params(context)
-    sensor.timeout = _positive_param(params, "sensor_timeout_seconds")
-    sensor.poke_interval = _positive_param(params, "poke_interval_seconds")
+    deferrable = params["deferrable"]
+    if not isinstance(deferrable, bool):
+        raise YellowDogArgumentError(
+            f"Param 'deferrable' must be true or false (got {deferrable!r})"
+        )
+    # Validate everything before changing anything
+    timeout = _positive_param(params, "sensor_timeout_seconds")
+    poke_interval = _positive_param(params, "poke_interval_seconds")
+    task.timeout = timeout
+    task.poke_interval = poke_interval
+    task.deferrable = deferrable
 
 
 def _get_wr_name(context: Context, prefix: str = "") -> str:
@@ -480,7 +350,10 @@ def _get_wr_name(context: Context, prefix: str = "") -> str:
 
 
 def _get_wp_name(context: Context) -> str:
-    return _get_entity_name(context, "wp-airflow")
+    # Includes the DAG ID so that copies of this DAG name their pools distinctly
+    task_instance: RuntimeTaskInstanceProtocol | None = context.get("ti")  # pyright: ignore[reportUnknownMemberType]  # Airflow Context.get overloads are partially untyped
+    assert task_instance is not None
+    return _get_entity_name(context, f"wp-{task_instance.dag_id}")
 
 
 def _get_worker_tag(context: Context) -> str:
@@ -490,23 +363,29 @@ def _get_worker_tag(context: Context) -> str:
 def _get_entity_name(context: Context, prefix: str) -> str:
     task_instance: RuntimeTaskInstanceProtocol | None = context.get("ti")  # pyright: ignore[reportUnknownMemberType]  # Airflow Context.get overloads are partially untyped
     assert task_instance is not None
-    return _normalise_yd_name(f"{prefix}-{task_instance.run_id}").replace(
-        "manual__", ""
-    )
+    # Drop "manual__" before normalising, so the result is still valid
+    run_id = task_instance.run_id.replace("manual__", "")
+    return _normalise_yd_name(f"{prefix}-{run_id}")
 
 
 def _normalise_yd_name(name: str) -> str:
     """
-    Format a string to be consistent with YellowDog naming requirements.
+    Format a string to be consistent with YellowDog naming requirements: at
+    most 60 characters, only lower-case letters, digits, underscore or
+    hyphen, starting with a letter and ending with a letter or digit.
     """
     # Make obvious substitutions
     new_yd_name = name.replace("/", "-").replace(" ", "_").replace(".", "_").lower()
 
-    # Enforce acceptable regex
-    new_yd_name = sub("[^a-z0-9_-]", "", new_yd_name)
+    # Enforce acceptable characters
+    new_yd_name = sub("[^a-z0-9_-]", "", new_yd_name).strip("-_")
 
-    # Mustn't exceed 60 chars
-    return new_yd_name[:60]
+    # Must start with a letter
+    if not new_yd_name[:1].isalpha():
+        new_yd_name = "x-" + new_yd_name if new_yd_name else "x"
+
+    # Mustn't exceed 60 chars, nor end with "-" or "_" once shortened
+    return new_yd_name[:60].rstrip("-_")
 
 
 ###############################################################################

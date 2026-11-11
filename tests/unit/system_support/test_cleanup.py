@@ -12,7 +12,12 @@ from yellowdog_client.model import (
 from yellowdog_client.model.exceptions import InvalidRequestException
 from yellowdog_client.platform_client import PlatformClient
 
-from tests.system.cleanup import PROVISIONED_TYPE, sweep
+from tests.system.cleanup import (
+    PROVISIONED_TYPE,
+    has_run_tag_prefix,
+    name_matches,
+    sweep,
+)
 
 NS = "ns"
 FRAG = "systest-1"
@@ -218,3 +223,56 @@ def test_system_tests_skipped_without_config(
     result = pytester.runpytest("-m", "system", "-rs")
     result.assert_outcomes(skipped=1)
     result.stdout.fnmatch_lines(["*system-test config not found at*"])
+
+
+def wr_tagged(
+    id: str, name: str, status: WorkRequirementStatus, tag: str | None
+) -> WorkRequirementSummary:
+    summary = wr(id, name, status)
+    summary.tag = tag
+    return summary
+
+
+PREFIX = "airflow:0123456789ab"
+
+
+def test_sweep_matches_work_requirements_by_run_tag_prefix() -> None:
+    client = make_client(
+        [
+            # Derived name without the fragment, but this DAG run's tag
+            wr_tagged("w1", "derived", WorkRequirementStatus.RUNNING, f"{PREFIX}:x:c0"),
+            # Another run's tag (the prefix is not followed by ":")
+            wr_tagged("w2", "other", WorkRequirementStatus.RUNNING, f"{PREFIX}ff:x"),
+            wr_tagged("w3", "untagged", WorkRequirementStatus.RUNNING, None),
+            wr_tagged("w4", "done", WorkRequirementStatus.COMPLETED, f"{PREFIX}:x:c0"),
+        ],
+        [],
+        [],
+    )
+    report = sweep(client, NS, FRAG, MagicMock(), run_tag_prefixes=[PREFIX])
+    assert report.cancelled_work_requirements == ["w1"]
+
+
+def test_sweep_matches_extra_name_fragments() -> None:
+    client = make_client(
+        [wr("w1", "a-wr-extra", WorkRequirementStatus.RUNNING)],
+        [
+            wp("p1", "wp-extra-shortened", WorkerPoolStatus.IDLE),
+            wp("p2", "other", WorkerPoolStatus.IDLE),
+        ],
+        [cr("c1", "wp-extra-shortened", ComputeRequirementStatus.RUNNING)],
+    )
+    report = sweep(
+        client, NS, FRAG, MagicMock(), extra_fragments=["wp-extra", "a-wr-extra"]
+    )
+    assert report.cancelled_work_requirements == ["w1"]
+    assert report.shut_down_worker_pools == ["p1"]
+    assert report.terminated_compute_requirements == ["c1"]
+
+
+def test_empty_extra_fragment_matches_nothing() -> None:
+    assert not name_matches("anything", FRAG, [""])
+    assert name_matches(f"x-{FRAG}", FRAG, [""])
+    assert has_run_tag_prefix(f"{PREFIX}:t", [PREFIX])
+    assert not has_run_tag_prefix(None, [PREFIX])
+    assert not has_run_tag_prefix(f"{PREFIX}:t", [])

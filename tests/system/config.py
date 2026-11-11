@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from tests.system.versions import is_label
 
 # Anchored to this directory so the tests can run from any working directory
@@ -17,6 +19,17 @@ CONFIG_PATH_ENV_VAR = "YD_SYSTEM_TEST_CONFIG"
 # Space/comma-separated Airflow version labels; overrides e2e.airflow_versions
 AIRFLOW_ENV_VAR = "YD_SYSTEM_TEST_AIRFLOW"
 DEFAULT_AIRFLOW_VERSIONS = ["min", "max"]
+# Default arguments, by task type, of a task that exits non-zero and of one
+# that runs for several minutes. Other task types have no defaults: set the
+# keys in the config, or the tests that need them are skipped.
+DEFAULT_FAILING_TASK_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "bash": ("-c", "exit 1"),
+    "docker": ("alpine", "false"),  # docker run <image> <command>
+}
+DEFAULT_LONG_TASK_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "bash": ("-c", "sleep 900"),
+    "docker": ("alpine", "sleep", "900"),
+}
 
 
 class ConfigError(Exception):
@@ -39,6 +52,11 @@ class SystemTestConfig:
     airflow_versions: list[str]
     user_data: str | None
     ui_port: int | None = None
+    # Task arguments for a task that exits non-zero (the task fails), and for
+    # one that runs for several minutes; None if neither configured nor
+    # defaulted for the task type
+    failing_task_arguments: tuple[str, ...] | None = None
+    long_task_arguments: tuple[str, ...] | None = None
 
 
 def config_path() -> Path:
@@ -115,6 +133,32 @@ def load_config(path: Path) -> SystemTestConfig:
             f"X.Y.Z, got {airflow_versions!r}"
         )
 
+    task_type = resources.get("task_type", "docker")
+
+    def string_list(
+        key: str, defaults: dict[str, tuple[str, ...]]
+    ) -> tuple[str, ...] | None:
+        """The configured list, else the task type's default (if any)."""
+        if key not in resources:
+            return defaults.get(task_type)
+        value = resources[key]
+        if (
+            not isinstance(value, list)
+            or not value
+            or not all(isinstance(v, str) for v in value)
+        ):
+            raise ConfigError(
+                f"resources.{key}: must be a non-empty list of strings, got {value!r}"
+            )
+        return tuple(value)
+
+    failing_task_arguments = string_list(
+        "failing_task_arguments", DEFAULT_FAILING_TASK_ARGUMENTS
+    )
+    long_task_arguments = string_list(
+        "long_task_arguments", DEFAULT_LONG_TASK_ARGUMENTS
+    )
+
     return SystemTestConfig(
         api_url=platform.get("api_url", "https://api.yellowdog.ai"),
         key_id=platform["key_id"],
@@ -122,7 +166,7 @@ def load_config(path: Path) -> SystemTestConfig:
         namespace=resources["namespace"],
         compute_requirement_template=resources["compute_requirement_template"],
         image_family=resources["image_family"],
-        task_type=resources.get("task_type", "docker"),
+        task_type=task_type,
         task_arguments=list(resources.get("task_arguments", ["hello-world"])),
         max_instances=limits.get("max_instances", 1),
         poke_interval_seconds=limits.get("poke_interval_seconds", 10),
@@ -130,7 +174,25 @@ def load_config(path: Path) -> SystemTestConfig:
         airflow_versions=list(airflow_versions),
         user_data=user_data,
         ui_port=ui_port,
+        failing_task_arguments=failing_task_arguments,
+        long_task_arguments=long_task_arguments,
     )
+
+
+def task_arguments_or_skip(config: SystemTestConfig, key: str) -> list[str]:
+    """
+    ``config``'s ``failing_task_arguments`` or ``long_task_arguments``
+    (``key``) as a list; skips the calling test if it is neither configured
+    nor defaulted for the task type.
+    """
+    value: tuple[str, ...] | None = getattr(config, key)
+    if value is None:
+        pytest.skip(
+            f"resources.{key} is not set and has no default for task type "
+            f"'{config.task_type}' (defaults exist for: "
+            f"{', '.join(sorted(DEFAULT_FAILING_TASK_ARGUMENTS))})"
+        )
+    return list(value)
 
 
 def airflow_labels(configured: list[str]) -> list[str]:

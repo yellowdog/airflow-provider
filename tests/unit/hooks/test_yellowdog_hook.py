@@ -12,6 +12,7 @@ from yellowdog_client.model import (
 from yellowdog_provider.exceptions.yellowdog_exceptions import YellowDogException
 from yellowdog_provider.hooks.yellowdog_hooks import YellowDogHook
 
+APP_KEY_SECRET_NAME_RE = "Application Key Secret"
 CREATE = "yellowdog_provider.hooks.yellowdog_hooks.PlatformClient.create"
 
 
@@ -97,6 +98,56 @@ def test_close_and_context_manager(yd_connection: Connection) -> None:
     create.return_value.close.assert_called_once()
     h.close()  # no client: no-op
     create.return_value.close.assert_called_once()
+
+
+def test_get_conn_uses_given_connection_without_lookup() -> None:
+    conn = _conn(host="api.other.yellowdog", login="k2", password="s2")
+    with (
+        patch.object(
+            YellowDogHook, "get_connection", side_effect=AssertionError("lookup")
+        ),
+        patch(CREATE) as create,
+        YellowDogHook("yd_test", connection=conn) as hook,
+    ):
+        assert hook.get_conn() is hook.get_conn()
+    create.assert_called_once_with(
+        ServicesSchema(defaultUrl="https://api.other.yellowdog"),
+        ApiKey("k2", "s2"),
+    )
+    create.return_value.close.assert_called_once()
+
+
+def test_given_connection_missing_credentials_raises() -> None:
+    with (
+        patch.object(
+            YellowDogHook, "get_connection", side_effect=AssertionError("lookup")
+        ),
+        patch(CREATE) as create,
+        pytest.raises(YellowDogException, match=APP_KEY_SECRET_NAME_RE),
+    ):
+        YellowDogHook("yd_test", connection=_conn(password=None)).get_conn()
+    create.assert_not_called()
+
+
+def test_portal_base_url_uses_given_connection() -> None:
+    conn = _conn(host="https://api.other.yellowdog")
+    with patch.object(
+        YellowDogHook, "get_connection", side_effect=AssertionError("lookup")
+    ):
+        hook = YellowDogHook("yd_test", connection=conn)
+        assert hook.portal_base_url() == "https://portal.other.yellowdog"
+
+
+def test_portal_url_override_without_scheme_defaults_to_https() -> None:
+    conn = _conn(extra='{"portal_url": " my.portal.example/ "}')
+    hook = YellowDogHook("yd_test", connection=conn)
+    assert hook.portal_base_url() == "https://my.portal.example"
+
+
+def test_portal_url_override_keeps_given_scheme() -> None:
+    conn = _conn(extra='{"portal_url": "http://my.portal.example"}')
+    hook = YellowDogHook("yd_test", connection=conn)
+    assert hook.portal_base_url() == "http://my.portal.example"
 
 
 def test_connection_get_hook_constructs_hook() -> None:

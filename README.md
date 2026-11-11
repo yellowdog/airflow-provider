@@ -2,9 +2,15 @@
 
 The YellowDog Provider for Apache Airflow provides:
 
-- A Hook to support YellowDog Application credentials as Airflow Connections
-- Operator classes to create and manage YellowDog Work Requirements and Worker Pools
+- Operators for the usual three-task DAG: provision a YellowDog Worker Pool (a setup task that waits until the pool is ready), run Work Requirements on it (`RunWorkRequirement` submits and waits until the work completes), and shut the pool down (a teardown task that also cancels the DAG run's unfinished work)
+- Finer-grained operators to submit, extend and cancel Work Requirements step by step
 - Sensor classes to monitor the states of YellowDog Work Requirements, Worker Pools and Compute Requirements
+- Deferrable waits: operators and sensors can hand their waits to Airflow's triggerer instead of holding a worker slot
+- Safe retries: submitted work is stamped with its DAG run and task, so a retry carries on with the earlier attempt rather than duplicating it, and work is cancelled (aborting running tasks) when a task gives up or is killed
+- A Hook that keeps YellowDog Application credentials in Airflow Connections, with typed operations for TaskFlow `@task` functions
+- Links from Airflow tasks to the YellowDog Portal
+
+If more than one Airflow environment uses the same YellowDog account, set a distinct `[yellowdog] deployment_id` (`AIRFLOW__YELLOWDOG__DEPLOYMENT_ID`) in each; see the documentation.
 
 ## Documentation
 
@@ -60,7 +66,7 @@ make system-test-cleanup  # sweep up any resources left behind by failed runs
 By default both live test targets run at the lowest **and** highest supported Airflow: `min` (the `apache-airflow` floor in `pyproject.toml`) and `max` (the latest Airflow on PyPI). Live tests always use the latest `yellowdog-sdk` at both versions; only CI's min rows pin the `yellowdog-sdk` floor. Select versions with `AIRFLOW` on the make command line, e.g. `make system-test AIRFLOW=min` or `make e2e-test AIRFLOW="max 3.2.1"` (labels `min`, `max` or an explicit `X.Y.Z`, separated by spaces or commas). An `AIRFLOW` variable exported in your shell is ignored, so it can't silently change both targets.
 
 - `make system-test` runs the component tests once per version, each in its own uv venv (`.venv-systest-<label>`, Python 3.12, installed with Airflow's constraints by [bin/systest_env.py](bin/systest_env.py) and reused until `pyproject.toml` changes or a new `yellowdog-sdk` release (or, for `max`, Airflow release) appears on PyPI). Every version runs even if another fails; the target fails if any did. The pytest header shows the Airflow and `yellowdog-sdk` versions in use.
-- `make e2e-test` runs the e2e test once per version in `apache/airflow:slim-<version>-python3.12`, each with its own container and DAG run. Without `AIRFLOW`, the versions come from `airflow_versions` under `[e2e]` in the config (default `["min", "max"]`); `YD_SYSTEM_TEST_AIRFLOW` also overrides it when running pytest directly. With `ui_port` set, the n-th version's UI is on `ui_port + n`. Versions are resolved when each test starts; if a new Airflow release has no `slim-<version>-python3.12` image on Docker Hub yet, the test fails naming the missing tag (choose an explicit version until the image is published).
+- `make e2e-test` runs the e2e tests once per version in `apache/airflow:slim-<version>-python3.12`, each version with its own container: the example DAG with every wait deferred (must succeed), with failing work (the run must fail and its teardown succeed), and, on Airflow 3.3 and later, a deferred task marked failed through the REST API (its work requirement must be cancelled by the trigger). Failing and long-running work use `failing_task_arguments` and `long_task_arguments` under `[resources]`, which default by `task_type` (`bash` and `docker`; see the example config). For any other task type, set them, or the tests that need them (in both targets) are skipped. Without `AIRFLOW`, the versions come from `airflow_versions` under `[e2e]` in the config (default `["min", "max"]`); `YD_SYSTEM_TEST_AIRFLOW` also overrides it when running pytest directly. With `ui_port` set, the n-th version's UI is on `ui_port + n`. Versions are resolved when each version's container starts; if a new Airflow release has no `slim-<version>-python3.12` image on Docker Hub yet, the test fails naming the missing tag (choose an explicit version until the image is published).
 
 ### Starting a Local Airflow Instance
 
@@ -78,8 +84,8 @@ Please inspect the script for instructions on its customisation and use.
 
 The example DAGs are in [yellowdog_provider/example_dags](yellowdog_provider/example_dags), and are loaded automatically by the Airflow container above:
 
-- [yd-quickstart.py](yellowdog_provider/example_dags/yd-quickstart.py) — a minimal DAG
-- [yd-provider-test.py](yellowdog_provider/example_dags/yd-provider-test.py) — exercises all the provider components; configured through DAG params (connection, namespace, compute requirement template, image family, task type and arguments, `sensor_timeout_seconds`, `poke_interval_seconds`, `max_nodes`, optional `user_data`) when triggering the DAG
+- [yd-quickstart.py](yellowdog_provider/example_dags/yd-quickstart.py) — a minimal DAG: one `RunWorkRequirement` on an existing worker pool
+- [yd-provider-test.py](yellowdog_provider/example_dags/yd-provider-test.py) — the three-task pattern: provisions a worker pool (setup), runs two work requirements on it, and shuts it down (teardown); configured through DAG params (connection, namespace, compute requirement template, image family, task type and arguments, `sensor_timeout_seconds`, `poke_interval_seconds`, `max_nodes`, `deferrable`, optional `user_data`) when triggering the DAG
 
 ### Releasing
 

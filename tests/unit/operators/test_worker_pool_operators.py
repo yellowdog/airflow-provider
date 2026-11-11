@@ -1,23 +1,40 @@
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from datetime import timedelta
+from itertools import chain, repeat
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 import pytest
+from requests import HTTPError
 from yellowdog_client.model import (
+    ComputeRequirementStatus,
     ComputeRequirementTemplateUsage,
     ConfiguredWorkerPool,
     ProvisionedWorkerPool,
     WorkerPool,
+    WorkerPoolStatus,
+    WorkRequirementStatus,
 )
+from yellowdog_client.model.exceptions import InvalidRequestException
 
 from tests.support import make_context, render
+from tests.unit.hooks.test_hook_operations import FakePlatform
 from yellowdog_provider.exceptions.yellowdog_exceptions import (
+    WaitTimeoutError,
     YellowDogArgumentError,
     YellowDogException,
+    YellowDogStateError,
 )
+from yellowdog_provider.hooks.yellowdog_hooks import YellowDogHook
+from yellowdog_provider.operators import yellowdog_operators as ops
 from yellowdog_provider.operators.yellowdog_operators import (
     ProvisionWorkerPool,
     ShutdownProvisionedWorkerPool,
 )
+from yellowdog_provider.triggers.yellowdog_triggers import YellowDogStateTrigger
+from yellowdog_provider.utils.airflow_compat import TaskDeferred
+from yellowdog_provider.utils.run_stamp import RunStamp
 
 
 def _with(obj: Any, **attrs: Any) -> Any:
@@ -75,6 +92,7 @@ def test_shutdown_by_id(mock_client: MagicMock) -> None:
 
 def test_shutdown_by_name(mock_client: MagicMock) -> None:
     mock_client.worker_pool_client.get_worker_pool_by_name.return_value = _pool()
+    mock_client.worker_pool_client.get_worker_pool_by_id.return_value = _pool()
     op = ShutdownProvisionedWorkerPool(
         task_id="t", namespace="ns", worker_pool_name="pool"
     )
@@ -129,3 +147,675 @@ def test_id_rendering_to_None_raises(mock_client: MagicMock) -> None:
     with pytest.raises(YellowDogArgumentError, match="upstream XCom"):
         _run(op)
     mock_client.worker_pool_client.get_worker_pool_by_id.assert_not_called()
+
+
+# == setup/teardown behaviour ================================================
+
+WP = WorkerPoolStatus
+CR = ComputeRequirementStatus
+STAMP = RunStamp("test_dag", "test_run", "run", -1)  # Another task, this run
+
+
+_REAL_SHUTDOWN = YellowDogHook.shutdown_worker_pool
+
+
+def _use_real_shutdown(pool_fake: "PoolFake") -> None:
+    """Route the fake's shutdown to the real hook method (its tolerances)."""
+    pool_fake.shutdown.side_effect = lambda pool_id, *, terminate_immediately: (
+        _REAL_SHUTDOWN(
+            YellowDogHook(), pool_id, terminate_immediately=terminate_immediately
+        )
+    )
+
+
+@dataclass
+class PoolFake:
+    """Stand-in hook methods for the pool operators, patched onto the hook."""
+
+    provision: MagicMock
+    shutdown: MagicMock
+    pool_state: MagicMock
+    cr_state: MagicMock
+    pushed: dict[str, Any] = field(default_factory=dict[str, Any])
+
+
+@pytest.fixture
+def pool_fake(mock_client: MagicMock) -> Iterator[PoolFake]:
+    provision = MagicMock(return_value="wp-1")
+    shutdown = MagicMock(
+        side_effect=lambda _id, *, terminate_immediately: (
+            "cr-1" if terminate_immediately else None
+        )
+    )
+    pool_state = MagicMock(return_value=WP.IDLE)
+    cr_state = MagicMock(return_value=CR.TERMINATED)
+    with (
+        patch.object(YellowDogHook, "provision_worker_pool", provision),
+        patch.object(YellowDogHook, "shutdown_worker_pool", shutdown),
+        patch.object(YellowDogHook, "get_worker_pool_state", pool_state),
+        patch.object(YellowDogHook, "get_compute_requirement_state", cr_state),
+    ):
+        yield PoolFake(provision, shutdown, pool_state, cr_state)
+
+
+def _provision(**kw: Any) -> ProvisionWorkerPool:
+    kw.setdefault("compute_requirement_template_usage", _crtu())
+    kw.setdefault("poke_interval", 0)
+    kw.setdefault("deferrable", False)
+    return ProvisionWorkerPool(task_id="t", **kw)
+
+
+def _exec(op: Any, pushed: dict[str, Any] | None = None) -> Any:
+    ctx = make_context(pushed=pushed)
+    render(op, ctx)
+    return op.execute(ctx)
+
+
+def test_provision_defaults() -> None:
+    with patch.object(ops.conf, "getboolean", return_value=False):
+        op = ProvisionWorkerPool(
+            task_id="t", compute_requirement_template_usage=_crtu()
+        )
+    assert op.wait_until_ready is False
+    assert (op.poke_interval, op.timeout, op.deferrable) == (30, 3600, False)
+
+
+def test_provision_without_wait_does_not_check_state(pool_fake: PoolFake) -> None:
+    assert _exec(_provision()) == "wp-1"
+    pool_fake.pool_state.assert_not_called()
+    pool_fake.shutdown.assert_not_called()
+
+
+def test_provision_wait_until_ready_returns_on_idle(pool_fake: PoolFake) -> None:
+    pool_fake.pool_state.side_effect = [WP.PENDING, WP.CONFIGURING, WP.EMPTY, WP.IDLE]
+    pushed: dict[str, Any] = {}
+    assert _exec(_provision(wait_until_ready=True), pushed) == "wp-1"
+    assert pushed["return_value"] == "wp-1"
+    assert pool_fake.pool_state.call_count == 4
+    pool_fake.pool_state.assert_called_with("wp-1")
+    pool_fake.shutdown.assert_not_called()
+
+
+def test_provision_wait_until_ready_accepts_running(pool_fake: PoolFake) -> None:
+    pool_fake.pool_state.return_value = WP.RUNNING
+    assert _exec(_provision(wait_until_ready=True)) == "wp-1"
+
+
+@pytest.mark.parametrize("state", [WP.SHUTDOWN, WP.TERMINATED])
+def test_provision_wait_failure_terminates_pool(
+    pool_fake: PoolFake, state: WorkerPoolStatus
+) -> None:
+    pool_fake.pool_state.side_effect = [WP.PENDING, state]
+    with pytest.raises(YellowDogStateError) as info:
+        _exec(_provision(wait_until_ready=True))
+    assert info.value.current_state == state
+    pool_fake.shutdown.assert_called_once_with("wp-1", terminate_immediately=True)
+
+
+def test_provision_wait_timeout_terminates_pool(pool_fake: PoolFake) -> None:
+    pool_fake.pool_state.return_value = WP.EMPTY
+    with pytest.raises(WaitTimeoutError):
+        _exec(_provision(wait_until_ready=True, timeout=0))
+    pool_fake.shutdown.assert_called_once_with("wp-1", terminate_immediately=True)
+
+
+def test_provision_wait_error_terminates_and_cleanup_failure_not_masked(
+    pool_fake: PoolFake,
+) -> None:
+    pool_fake.pool_state.side_effect = YellowDogException("status boom")
+    pool_fake.shutdown.side_effect = RuntimeError("shutdown boom")
+    with pytest.raises(YellowDogException, match="status boom"):
+        _exec(_provision(wait_until_ready=True))
+    pool_fake.shutdown.assert_called_once_with("wp-1", terminate_immediately=True)
+
+
+class _Killed(BaseException):
+    """Stands in for Airflow interrupting a running task (not an Exception)."""
+
+
+def test_provision_killed_mid_wait_on_kill_terminates(pool_fake: PoolFake) -> None:
+    pool_fake.pool_state.side_effect = [WP.PENDING, _Killed()]
+    op = _provision(wait_until_ready=True)
+    with pytest.raises(_Killed):
+        _exec(op)
+    pool_fake.shutdown.assert_not_called()  # BaseException: no cleanup in execute
+    op.on_kill()
+    pool_fake.shutdown.assert_called_once_with("wp-1", terminate_immediately=True)
+
+
+def test_provision_on_kill_before_provision_does_nothing(pool_fake: PoolFake) -> None:
+    _provision(wait_until_ready=True).on_kill()
+    pool_fake.shutdown.assert_not_called()
+
+
+def test_provision_on_kill_never_raises(pool_fake: PoolFake) -> None:
+    pool_fake.pool_state.side_effect = [WP.PENDING, _Killed()]
+    pool_fake.shutdown.side_effect = RuntimeError("platform down")
+    op = _provision(wait_until_ready=True)
+    with pytest.raises(_Killed):
+        _exec(op)
+    op.on_kill()  # Logged, not raised
+    pool_fake.shutdown.assert_called_once()
+
+
+@pytest.mark.parametrize("wait", [True, False])
+def test_provision_on_kill_after_ready_leaves_pool(
+    pool_fake: PoolFake, wait: bool
+) -> None:
+    op = _provision(wait_until_ready=wait)
+    assert _exec(op) == "wp-1"
+    op.on_kill()
+    pool_fake.shutdown.assert_not_called()
+
+
+def test_provision_on_kill_after_deferred_ready_leaves_pool(
+    pool_fake: PoolFake,
+) -> None:
+    op = _provision(wait_until_ready=True, deferrable=True)
+    op.execute_complete(
+        make_context(), _pool_event("target", "IDLE"), worker_pool_id="wp-1"
+    )
+    op.on_kill()
+    pool_fake.shutdown.assert_not_called()
+
+
+def test_provision_defers_when_deferrable(pool_fake: PoolFake) -> None:
+    pool_fake.pool_state.return_value = WP.PENDING
+    pushed: dict[str, Any] = {}
+    op = _provision(
+        wait_until_ready=True,
+        deferrable=True,
+        poke_interval=15,
+        timeout=900,
+        connection_id="my_conn",
+    )
+    with patch(f"{ops.__name__}.time") as clock:
+        clock.time.return_value = 1000.0
+        with pytest.raises(TaskDeferred) as info:
+            _exec(op, pushed)
+    trigger = info.value.trigger
+    assert isinstance(trigger, YellowDogStateTrigger)
+    assert trigger.serialize()[1] == {
+        "connection_id": "my_conn",
+        "kind": "worker_pool",
+        "resource_id": "wp-1",
+        "target_states": ["IDLE", "RUNNING"],
+        "failure_states": ["SHUTDOWN", "TERMINATED"],
+        "poke_interval": 15.0,
+        "end_time": 1900.0,
+        "kill_action": "terminate_worker_pool",
+    }
+    assert info.value.method_name == "execute_complete"
+    assert info.value.kwargs == {"worker_pool_id": "wp-1"}
+    assert info.value.timeout == timedelta(seconds=900 + ops.DEFER_TIMEOUT_GRACE)
+    assert pushed["return_value"] == "wp-1"
+    pool_fake.shutdown.assert_not_called()
+
+
+def test_provision_deferrable_ready_on_first_check(pool_fake: PoolFake) -> None:
+    op = _provision(wait_until_ready=True, deferrable=True)
+    with patch.object(ProvisionWorkerPool, "defer") as defer:
+        assert _exec(op) == "wp-1"
+    defer.assert_not_called()
+
+
+def test_provision_deferrable_failure_on_first_check_terminates(
+    pool_fake: PoolFake,
+) -> None:
+    pool_fake.pool_state.return_value = WP.SHUTDOWN
+    with pytest.raises(YellowDogStateError):
+        _exec(_provision(wait_until_ready=True, deferrable=True))
+    pool_fake.shutdown.assert_called_once_with("wp-1", terminate_immediately=True)
+
+
+def _pool_event(status: str, state: str | None, **extra: Any) -> dict[str, Any]:
+    return {
+        "status": status,
+        "kind": "worker_pool",
+        "resource_id": "wp-1",
+        "state": state,
+        "message": f"message for {status}",
+        **extra,
+    }
+
+
+def test_provision_execute_complete_target(pool_fake: PoolFake) -> None:
+    op = _provision(wait_until_ready=True)
+    assert (
+        op.execute_complete(
+            make_context(), _pool_event("target", "IDLE"), worker_pool_id="wp-1"
+        )
+        == "wp-1"
+    )
+    pool_fake.shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "event, error",
+    [
+        (_pool_event("failure", "TERMINATED"), YellowDogStateError),
+        (_pool_event("timeout", "EMPTY"), WaitTimeoutError),
+        (_pool_event("error", None, error_type="HTTPError"), YellowDogException),
+        (_pool_event("weird", None), YellowDogException),
+    ],
+)
+def test_provision_execute_complete_failures_terminate(
+    pool_fake: PoolFake, event: dict[str, Any], error: type[Exception]
+) -> None:
+    pool_fake.shutdown.side_effect = RuntimeError("cleanup failed")  # Not masking
+    op = _provision(wait_until_ready=True, timeout=900)
+    with pytest.raises(error) as info:
+        op.execute_complete(make_context(), event, worker_pool_id="wp-1")
+    if isinstance(info.value, WaitTimeoutError):
+        assert info.value.timeout == 900
+    pool_fake.shutdown.assert_called_once_with("wp-1", terminate_immediately=True)
+
+
+# -- teardown ----------------------------------------------------------------
+
+
+@pytest.fixture
+def platform(mock_client: MagicMock) -> FakePlatform:
+    mock_client.worker_pool_client.get_worker_pool_by_id.return_value = _pool(
+        computeRequirementId="cr-1"
+    )
+    return FakePlatform(mock_client)
+
+
+def _shutdown(**kw: Any) -> ShutdownProvisionedWorkerPool:
+    kw.setdefault("worker_pool_id", "wp-1")
+    kw.setdefault("poke_interval", 0)
+    kw.setdefault("deferrable", False)
+    return ShutdownProvisionedWorkerPool(task_id="t", **kw)
+
+
+def _cancelled(platform: FakePlatform) -> list[Any]:
+    return platform.work.cancel_work_requirement_by_id.call_args_list
+
+
+def test_shutdown_defaults() -> None:
+    with patch.object(ops.conf, "getboolean", return_value=False):
+        op = ShutdownProvisionedWorkerPool(task_id="t", worker_pool_id="wp-1")
+    assert (op.wait, op.cancel_run_work_requirements) == (False, True)
+    assert (op.poke_interval, op.timeout, op.deferrable) == (30, 3600, False)
+
+
+def test_shutdown_cancels_unfinished_run_work_requirements(
+    platform: FakePlatform, mock_client: MagicMock
+) -> None:
+    order: list[str] = []
+    platform.work.cancel_work_requirement_by_id.side_effect = lambda i, a: (
+        order.append(f"cancel {i}") or platform._cancel(i, a)
+    )
+    mock_client.worker_pool_client.shutdown_worker_pool_by_id.side_effect = lambda i: (
+        order.append(f"shutdown {i}")
+    )
+    running = platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
+    held = platform.existing("b", STAMP, WorkRequirementStatus.HELD, cycle=3)
+    platform.existing("c", STAMP, WorkRequirementStatus.COMPLETED)
+    assert _exec(_shutdown()) == "wp-1"
+    assert sorted(_cancelled(platform)) == sorted(
+        [call(running.id, True), call(held.id, True)]
+    )
+    assert order[-1] == "shutdown wp-1"
+    assert platform.searches[-1].namespaces is None  # Every namespace
+
+
+def test_teardown_cancels_only_this_runs_work(platform: FakePlatform) -> None:
+    mine = platform.existing("mine", STAMP, WorkRequirementStatus.RUNNING)
+    other_run = RunStamp("test_dag", "other_run", "run", -1)
+    other_dag = RunStamp("other_dag", "test_run", "run", -1)
+    theirs = platform.existing("theirs", other_run, WorkRequirementStatus.RUNNING)
+    other = platform.existing("other", other_dag, WorkRequirementStatus.RUNNING)
+    untagged = platform.existing("untagged", None, WorkRequirementStatus.RUNNING)
+    named = platform.existing(
+        STAMP.run_tag_prefix(), None, WorkRequirementStatus.RUNNING
+    )
+    mine_elsewhere = platform.existing("mine2", STAMP, WorkRequirementStatus.HELD)
+    mine_elsewhere.namespace = "other-ns"
+    theirs_elsewhere = platform.existing(
+        "theirs2", other_run, WorkRequirementStatus.RUNNING
+    )
+    theirs_elsewhere.namespace = "other-ns"
+    other_deployment = platform.existing(
+        "other-deployment",
+        RunStamp("test_dag", "test_run", "run", -1, deployment_id="prod"),
+        WorkRequirementStatus.RUNNING,
+    )
+    _exec(_shutdown())
+    assert sorted(_cancelled(platform)) == sorted(
+        [call(mine.id, True), call(mine_elsewhere.id, True)]
+    )
+    for wr in (theirs, other, untagged, named, theirs_elsewhere, other_deployment):
+        assert wr.status == WorkRequirementStatus.RUNNING
+
+
+def test_shutdown_cancel_disabled(platform: FakePlatform) -> None:
+    platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
+    _exec(_shutdown(cancel_run_work_requirements=False))
+    platform.work.get_work_requirements.assert_not_called()
+    platform.work.cancel_work_requirement_by_id.assert_not_called()
+
+
+def test_shutdown_cancel_failure_does_not_stop_shutdown(
+    platform: FakePlatform, mock_client: MagicMock
+) -> None:
+    a = platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
+    b = platform.existing("b", STAMP, WorkRequirementStatus.RUNNING)
+    platform.work.cancel_work_requirement_by_id.side_effect = RuntimeError("boom")
+    assert _exec(_shutdown()) == "wp-1"
+    assert sorted(_cancelled(platform)) == sorted([call(a.id, True), call(b.id, True)])
+    mock_client.worker_pool_client.shutdown_worker_pool_by_id.assert_called_once_with(
+        "wp-1"
+    )
+
+
+def test_shutdown_search_failure_does_not_stop_shutdown(
+    platform: FakePlatform, mock_client: MagicMock
+) -> None:
+    platform.work.get_work_requirements.side_effect = RuntimeError("boom")
+    assert _exec(_shutdown()) == "wp-1"
+    mock_client.worker_pool_client.shutdown_worker_pool_by_id.assert_called_once()
+
+
+def test_shutdown_configured_pool_cancels_nothing(
+    platform: FakePlatform, mock_client: MagicMock
+) -> None:
+    platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
+    mock_client.worker_pool_client.get_worker_pool_by_id.return_value = _pool(
+        ConfiguredWorkerPool
+    )
+    with pytest.raises(YellowDogException, match="configured worker pool"):
+        _exec(_shutdown())
+    platform.work.cancel_work_requirement_by_id.assert_not_called()
+
+
+def test_shutdown_without_wait_checks_no_state(
+    platform: FakePlatform, pool_fake: PoolFake
+) -> None:
+    _exec(_shutdown(terminate_immediately=True))
+    pool_fake.pool_state.assert_not_called()
+    pool_fake.cr_state.assert_not_called()
+
+
+def test_shutdown_wait_waits_for_pool(
+    platform: FakePlatform, pool_fake: PoolFake
+) -> None:
+    pool_fake.pool_state.side_effect = [WP.RUNNING, WP.SHUTDOWN]
+    pushed: dict[str, Any] = {}
+    assert _exec(_shutdown(wait=True), pushed) == "wp-1"
+    assert pushed["return_value"] == "wp-1"
+    assert pool_fake.pool_state.call_count == 2
+    pool_fake.cr_state.assert_not_called()
+
+
+def test_shutdown_wait_terminate_waits_for_compute_requirement(
+    platform: FakePlatform, pool_fake: PoolFake, mock_client: MagicMock
+) -> None:
+    _use_real_shutdown(pool_fake)
+    pool_fake.pool_state.side_effect = [WP.RUNNING, WP.TERMINATED]
+    pool_fake.cr_state.side_effect = [CR.TERMINATING, CR.TERMINATED]
+    assert _exec(_shutdown(wait=True, terminate_immediately=True)) == "wp-1"
+    mock_client.compute_client.terminate_compute_requirement_by_id.assert_called_once_with(
+        "cr-1"
+    )
+    assert pool_fake.pool_state.call_count == 2
+    assert pool_fake.cr_state.call_count == 2
+    pool_fake.cr_state.assert_called_with("cr-1")
+
+
+def test_shutdown_wait_timeout_raises(
+    platform: FakePlatform, pool_fake: PoolFake
+) -> None:
+    pool_fake.pool_state.return_value = WP.RUNNING
+    with pytest.raises(WaitTimeoutError):
+        _exec(_shutdown(wait=True, timeout=0))
+
+
+def test_shutdown_wait_timeout_is_shared_by_both_waits(
+    platform: FakePlatform, pool_fake: PoolFake
+) -> None:
+    pool_fake.pool_state.return_value = WP.SHUTDOWN
+    pool_fake.cr_state.return_value = CR.TERMINATING
+    clock = chain([0.0], repeat(5.0))
+    with (
+        patch.object(ops.time, "monotonic", side_effect=clock),
+        pytest.raises(WaitTimeoutError) as info,
+    ):
+        _exec(_shutdown(wait=True, terminate_immediately=True, timeout=3))
+    assert info.value.last_state == CR.TERMINATING
+    assert (info.value.resource_id, info.value.timeout) == ("cr-1", 3)
+
+
+def _deferred(op: ShutdownProvisionedWorkerPool) -> Any:
+    with patch(f"{ops.__name__}.time") as clock:
+        clock.time.return_value = 1000.0
+        with pytest.raises(TaskDeferred) as info:
+            _exec(op)
+    return info.value
+
+
+def test_shutdown_defers_when_deferrable(
+    platform: FakePlatform, pool_fake: PoolFake
+) -> None:
+    pool_fake.pool_state.return_value = WP.RUNNING
+    op = _shutdown(
+        wait=True,
+        deferrable=True,
+        terminate_immediately=True,
+        poke_interval=15,
+        timeout=900,
+        connection_id="my_conn",
+    )
+    deferred = _deferred(op)
+    assert deferred.trigger.serialize()[1] == {
+        "connection_id": "my_conn",
+        "kind": "worker_pool",
+        "resource_id": "wp-1",
+        "target_states": ["SHUTDOWN", "TERMINATED"],
+        "failure_states": [],
+        "poke_interval": 15.0,
+        "end_time": 1900.0,
+    }
+    assert deferred.method_name == "execute_complete"
+    assert deferred.kwargs == {
+        "worker_pool_id": "wp-1",
+        "compute_requirement_id": "cr-1",
+        "end_time": 1900.0,
+    }
+    assert deferred.timeout == timedelta(seconds=900 + ops.DEFER_TIMEOUT_GRACE)
+
+    # The pool event chains a second deferral, for the compute requirement
+    pool_fake.cr_state.return_value = CR.TERMINATING
+    with patch(f"{ops.__name__}.time") as clock:
+        clock.time.return_value = 1100.0
+        with pytest.raises(TaskDeferred) as info:
+            op.execute_complete(
+                make_context(), _pool_event("target", "SHUTDOWN"), **deferred.kwargs
+            )
+    second: Any = info.value
+    assert second.trigger.serialize()[1] == {
+        "connection_id": "my_conn",
+        "kind": "compute_requirement",
+        "resource_id": "cr-1",
+        "target_states": ["TERMINATED"],
+        "failure_states": [],
+        "poke_interval": 15.0,
+        "end_time": 1900.0,
+    }
+    assert second.kwargs == {
+        "worker_pool_id": "wp-1",
+        "compute_requirement_id": None,
+        "end_time": 1900.0,
+    }
+    assert second.timeout == timedelta(seconds=800 + ops.DEFER_TIMEOUT_GRACE)
+
+    cr_event = {**_pool_event("target", "TERMINATED"), "kind": "compute_requirement"}
+    assert op.execute_complete(make_context(), cr_event, **second.kwargs) == "wp-1"
+
+
+def test_shutdown_deferrable_skips_finished_stages(
+    platform: FakePlatform, pool_fake: PoolFake
+) -> None:
+    pool_fake.pool_state.return_value = WP.TERMINATED
+    op = _shutdown(wait=True, deferrable=True, terminate_immediately=True)
+    with patch.object(ShutdownProvisionedWorkerPool, "defer") as defer:
+        assert _exec(op) == "wp-1"
+    defer.assert_not_called()
+
+
+def test_shutdown_deferrable_pool_only(
+    platform: FakePlatform, pool_fake: PoolFake
+) -> None:
+    pool_fake.pool_state.return_value = WP.RUNNING
+    deferred = _deferred(_shutdown(wait=True, deferrable=True))
+    assert deferred.kwargs["compute_requirement_id"] is None
+    op = _shutdown(wait=True, deferrable=True)
+    assert (
+        op.execute_complete(
+            make_context(), _pool_event("target", "SHUTDOWN"), **deferred.kwargs
+        )
+        == "wp-1"
+    )
+    pool_fake.cr_state.assert_not_called()
+
+
+def test_shutdown_without_wait_does_not_defer(
+    platform: FakePlatform, pool_fake: PoolFake
+) -> None:
+    with patch.object(ShutdownProvisionedWorkerPool, "defer") as defer:
+        assert _exec(_shutdown(deferrable=True)) == "wp-1"
+    defer.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "event, error",
+    [
+        (_pool_event("timeout", "RUNNING"), WaitTimeoutError),
+        (_pool_event("error", None, error_type="HTTPError"), YellowDogException),
+        (_pool_event("weird", None), YellowDogException),
+    ],
+)
+def test_shutdown_execute_complete_failures(
+    pool_fake: PoolFake, event: dict[str, Any], error: type[Exception]
+) -> None:
+    op = _shutdown(wait=True, timeout=900)
+    with pytest.raises(error):
+        op.execute_complete(
+            make_context(),
+            event,
+            worker_pool_id="wp-1",
+            compute_requirement_id="cr-1",
+            end_time=1900.0,
+        )
+    pool_fake.cr_state.assert_not_called()
+
+
+def test_shutdown_failure_still_terminates_compute_requirement(
+    platform: FakePlatform, mock_client: MagicMock
+) -> None:
+    pools = mock_client.worker_pool_client
+    pools.shutdown_worker_pool_by_id.side_effect = RuntimeError("platform down")
+    with pytest.raises(RuntimeError, match="platform down"):
+        _exec(_shutdown(terminate_immediately=True))
+    mock_client.compute_client.terminate_compute_requirement_by_id.assert_called_once_with(
+        "cr-1"
+    )
+
+
+def test_shutdown_failure_without_terminate_raises(
+    platform: FakePlatform, mock_client: MagicMock
+) -> None:
+    pools = mock_client.worker_pool_client
+    pools.shutdown_worker_pool_by_id.side_effect = RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"):
+        _exec(_shutdown())
+    mock_client.compute_client.terminate_compute_requirement_by_id.assert_not_called()
+
+
+def test_provision_cleanup_terminates_compute_requirement_if_shutdown_rejected(
+    mock_client: MagicMock,
+) -> None:
+    """Uses the real hook: shutdown and terminate are independent."""
+    pools = mock_client.worker_pool_client
+    pools.provision_worker_pool.return_value = _pool()
+    pools.get_worker_pool_by_id.return_value = _pool(
+        status=WP.SHUTDOWN, computeRequirementId="cr-1"
+    )
+    pools.shutdown_worker_pool_by_id.side_effect = InvalidRequestException(
+        "Invalid transition"
+    )
+    with pytest.raises(YellowDogStateError):
+        _exec(_provision(wait_until_ready=True))
+    mock_client.compute_client.terminate_compute_requirement_by_id.assert_called_once_with(
+        "cr-1"
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        InvalidRequestException("Invalid transition: pool is SHUTDOWN"),
+        HTTPError("400 Client Error: INVALID TRANSITION"),
+    ],
+)
+def test_teardown_of_already_shut_down_pool_succeeds(
+    platform: FakePlatform,
+    pool_fake: PoolFake,
+    mock_client: MagicMock,
+    error: Exception,
+) -> None:
+    _use_real_shutdown(pool_fake)
+    mock_client.worker_pool_client.shutdown_worker_pool_by_id.side_effect = error
+    pool_fake.pool_state.return_value = WP.SHUTDOWN
+    pool_fake.cr_state.side_effect = [CR.TERMINATING, CR.TERMINATED]
+    op = _shutdown(wait=True, terminate_immediately=True)
+    assert _exec(op) == "wp-1"
+    mock_client.compute_client.terminate_compute_requirement_by_id.assert_called_once_with(
+        "cr-1"
+    )
+    assert pool_fake.cr_state.call_count == 2  # Still waited
+
+
+def test_teardown_of_already_shut_down_pool_without_terminate(
+    platform: FakePlatform, mock_client: MagicMock
+) -> None:
+    mock_client.worker_pool_client.shutdown_worker_pool_by_id.side_effect = (
+        InvalidRequestException("invalid transition")
+    )
+    assert _exec(_shutdown()) == "wp-1"
+    mock_client.compute_client.terminate_compute_requirement_by_id.assert_not_called()
+
+
+def test_shutdown_other_platform_errors_still_raise(
+    platform: FakePlatform, mock_client: MagicMock
+) -> None:
+    mock_client.worker_pool_client.shutdown_worker_pool_by_id.side_effect = (
+        InvalidRequestException("Pool is locked")
+    )
+    with pytest.raises(InvalidRequestException):
+        _exec(_shutdown())
+
+
+def test_teardown_retry_after_compute_requirement_terminated_succeeds(
+    platform: FakePlatform, pool_fake: PoolFake, mock_client: MagicMock
+) -> None:
+    _use_real_shutdown(pool_fake)
+    mock_client.worker_pool_client.shutdown_worker_pool_by_id.side_effect = (
+        InvalidRequestException("invalid transition")
+    )
+    terminate = mock_client.compute_client.terminate_compute_requirement_by_id
+    terminate.side_effect = InvalidRequestException("Invalid transition: TERMINATED")
+    pool_fake.pool_state.return_value = WP.TERMINATED
+    pool_fake.cr_state.return_value = CR.TERMINATED
+    assert _exec(_shutdown(terminate_immediately=True, wait=True)) == "wp-1"
+    terminate.assert_called_once_with("cr-1")
+
+
+def test_teardown_other_terminate_errors_raise(
+    platform: FakePlatform, mock_client: MagicMock
+) -> None:
+    terminate = mock_client.compute_client.terminate_compute_requirement_by_id
+    terminate.side_effect = InvalidRequestException("Quota exceeded")
+    with pytest.raises(InvalidRequestException, match="Quota"):
+        _exec(_shutdown(terminate_immediately=True))

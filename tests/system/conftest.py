@@ -82,8 +82,33 @@ def run_tag() -> str:
 
 
 @pytest.fixture(scope="session")
+def sweep_run_tag_prefixes() -> list[str]:
+    """
+    DAG-run tag prefixes (``RunStamp.run_tag_prefix()``) of the DAG runs the
+    tests use. Tests append to it; the ``yd_client`` sweep also cancels live
+    work requirements whose tag carries one of them, since names derived from
+    a run's IDs are shortened and need not contain the run tag.
+    """
+    return []
+
+
+@pytest.fixture(scope="session")
+def sweep_name_fragments() -> list[str]:
+    """
+    Extra resource names (or name fragments) the ``yd_client`` sweep also
+    matches: tests append the names of resources whose names cannot contain
+    the whole run tag (e.g. names derived from a DAG run ID and shortened).
+    """
+    return []
+
+
+@pytest.fixture(scope="session")
 def yd_client(
-    system_config: SystemTestConfig, run_tag: str, pytestconfig: pytest.Config
+    system_config: SystemTestConfig,
+    run_tag: str,
+    pytestconfig: pytest.Config,
+    sweep_run_tag_prefixes: list[str],
+    sweep_name_fragments: list[str],
 ) -> Iterator[PlatformClient]:
     client = PlatformClient.create(
         ServicesSchema(defaultUrl=system_config.api_url),
@@ -94,7 +119,12 @@ def yd_client(
     finally:
         try:
             report = sweep(
-                client, system_config.namespace, run_tag, SweepLog(pytestconfig)
+                client,
+                system_config.namespace,
+                run_tag,
+                SweepLog(pytestconfig),
+                run_tag_prefixes=list(dict.fromkeys(sweep_run_tag_prefixes)),
+                extra_fragments=[f for f in dict.fromkeys(sweep_name_fragments) if f],
             )
             record_sweep(pytestconfig, f"Sweep for '{run_tag}': {report}")
         finally:

@@ -140,13 +140,15 @@ provider raises
    Templated field 'work_requirement_id' rendered to 'None'; the upstream XCom
    value is probably missing (did the upstream task fail or return nothing?)
 
-This most often happens in teardown tasks with
-``trigger_rule=TriggerRule.ALL_DONE``, which run even when the task that
-created the resource failed. In that case there is nothing to clean up, and
-the error is expected. If you want teardown to work independently of XCom,
-identify resources by namespace and name instead, with names derived from the
-run (for example from ``run_id``), as the package's example DAG
-``yd-provider-test.py`` does.
+This most often happens in a task that runs even though an upstream task
+failed, such as a clean-up task with ``trigger_rule=TriggerRule.ALL_DONE``.
+Airflow *teardown* tasks (``.as_teardown(setups=...)``) are less affected,
+because Airflow does not run a teardown whose setup task failed, so the
+setup's XCom value is there whenever the teardown runs. The package's example
+DAG ``yd-provider-test.py`` therefore passes the pool's ID from XCom to its
+teardown. Prefer IDs to names: a name built from the run can match another
+resource, and a work requirement's name can differ from the one supplied
+(see :ref:`safe-retries`).
 
 In ID and name fields, a value that renders to an empty or whitespace-only
 string is treated as not supplied.
@@ -156,6 +158,33 @@ renders as the Python value ``None`` instead, which is treated as *not
 supplied*: you then get the "either the ID or all of the names must be
 supplied" error, or, if you also gave names, the lookup silently uses the
 names.
+
+.. _sdk-objects-xcom:
+
+Why SDK objects cannot come from XCom
+-------------------------------------
+
+It would be natural to build a ``WorkRequirement`` in a TaskFlow ``@task``
+and pass its result to an operator. This does not work on any supported
+Airflow version (checked on 3.1 and 3.4): XCom cannot carry YellowDog SDK
+objects, for three independent reasons.
+
+- Airflow deserialises only classes on its allow-list (``[core]
+  allowed_deserialization_classes``, by default ``airflow.*`` only), so SDK
+  classes are refused unless every deployment adds ``yellowdog_client.*``.
+- Even when allowed, most SDK model classes (``WorkRequirement``,
+  ``TaskGroup``, ``Task`` and others) have fields that the platform sets
+  (``id``, ``status`` and so on) and that their constructors do not accept, so
+  Airflow cannot rebuild them.
+- Enum values, such as ``NodeWorkerTargetType`` in
+  ``ProvisionedWorkerPoolProperties``, cannot be serialised at all.
+
+So build SDK objects where they are used: in a **callable** passed to the
+operator (as on this page), which Airflow calls with the run's context when
+the task runs. Upstream tasks can pass plain values (IDs, names, numbers,
+lists, dicts) through XCom, and the callable can read them with
+``context["ti"].xcom_pull(...)``. In your own ``@task`` functions, build the
+objects inside the task (see :doc:`taskflow`).
 
 Unrendered callables
 --------------------

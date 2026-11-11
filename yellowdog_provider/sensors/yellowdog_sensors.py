@@ -6,11 +6,14 @@ set of states is reached, and fail if a failure state is reached instead.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Collection, Sequence
+from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
 from typing import Any, cast
 
-from airflow.sdk import BaseSensorOperator, Context
+from airflow.sdk import BaseOperatorLink, BaseSensorOperator, Context
 from yellowdog_client.model import (
     ComputeRequirementStatus,
     WorkerPoolStatus,
@@ -18,15 +21,29 @@ from yellowdog_client.model import (
 )
 
 from yellowdog_provider.exceptions.yellowdog_exceptions import (
-    YellowDogArgumentError,
+    YellowDogException,
     YellowDogStateError,
 )
 from yellowdog_provider.hooks.yellowdog_hooks import YellowDogHook
+from yellowdog_provider.links.yellowdog_links import (
+    WorkerPoolPortalLink,
+    WorkRequirementPortalLink,
+)
+from yellowdog_provider.triggers.yellowdog_triggers import (
+    ResourceKind,
+    YellowDogStateTrigger,
+)
+from yellowdog_provider.utils.airflow_compat import (
+    AirflowSensorTimeout,
+    AirflowSkipException,
+    conf,
+)
 from yellowdog_provider.utils.templating import (
     Templated,
     resolve,
     resolve_optional_str,
 )
+from yellowdog_provider.utils.waiting import resolve_states
 from yellowdog_provider.utils.yellowdog_utils import (
     get_compute_requirement_by_id_or_name,
     get_work_requirement_by_id_or_name,
@@ -60,6 +77,17 @@ class ObjectName(Enum):
     COMPUTE_REQUIREMENT = "compute requirement"
 
 
+@dataclass(frozen=True)
+class _WaitSpec:
+    """What a sensor waits for, in the form its deferral trigger needs."""
+
+    kind: ResourceKind
+    object_type: ObjectName
+    status_type: type[Enum]
+    target_states: Sequence[Enum]
+    failure_states: Sequence[Enum]
+
+
 class YellowDogSensor(BaseSensorOperator):
     """
     Base class for YellowDog sensors. All arguments are keyword-only.
@@ -70,6 +98,21 @@ class YellowDogSensor(BaseSensorOperator):
     :type connection_id: str | Callable
     :param poke_interval: the time between sensor checks in seconds (default = 60)
     :type poke_interval: float
+    :param deferrable: if true, the sensor checks once, then defers to the
+        triggerer, which polls every ``poke_interval`` seconds without
+        occupying a worker slot; the wait is limited to ``timeout`` seconds
+        from the start of the sensor. Defaults to Airflow's
+        ``[operators] default_deferrable`` setting (false unless configured),
+        read when the sensor is constructed. A deferrable sensor ignores
+        ``mode="reschedule"`` (deferral takes precedence). Failure
+        semantics when deferrable: ``soft_fail`` skips the task on a failure
+        state or a timeout (not on other errors) and ``never_fail`` skips it
+        on any of these or on any other error. A polling sensor differs on a
+        timeout: Airflow's poke loop skips only with ``soft_fail`` and fails
+        with ``never_fail``. ``silent_fail`` has no
+        effect, because there is no later poke to retry: an error in the
+        initial check, or one reported by the triggerer, fails the task.
+    :type deferrable: bool | None
 
     Other keyword arguments are passed to Airflow's BaseSensorOperator
     (e.g., ``timeout``, ``mode``).
@@ -82,6 +125,7 @@ class YellowDogSensor(BaseSensorOperator):
         *,
         connection_id: Templated[str] = YellowDogHook.default_conn_name,
         poke_interval: float = 60,  # Seconds
+        deferrable: bool | None = None,
         **kwargs: Any,
     ) -> None:
         # Airflow's BaseSensorOperator.__init__ has untyped **kwargs
@@ -89,11 +133,123 @@ class YellowDogSensor(BaseSensorOperator):
             poke_interval=poke_interval, **kwargs
         )
         self.connection_id = connection_id
+        self.deferrable: bool = (
+            conf.getboolean("operators", "default_deferrable", fallback=False)
+            if deferrable is None
+            else deferrable
+        )
         self.xcom_written: bool = False
+        self._resolved: tuple[str, str | None, str | None] | None = None
 
     def get_hook(self) -> YellowDogHook:
         """Return a hook for the (rendered) connection ID."""
         return YellowDogHook(resolve(self.connection_id, "connection_id"))
+
+    def _wait_spec(self) -> _WaitSpec:
+        """What the sensor waits for (provided by each concrete sensor)."""
+        raise NotImplementedError
+
+    def execute(self, context: Context) -> Any:
+        """
+        If not deferrable, poll as Airflow's ``BaseSensorOperator`` does.
+        Otherwise check once and, unless the target (or a failure) state is
+        already reached, defer to a :class:`.YellowDogStateTrigger`.
+        """
+        if not self.deferrable:
+            return super().execute(context)
+
+        try:
+            reached = self.poke(context)
+        except AirflowSkipException:
+            raise
+        except YellowDogStateError as exc:
+            if self.soft_fail or self.never_fail:
+                raise AirflowSkipException(
+                    f"Skipping due to {'soft_fail' if self.soft_fail else 'never_fail'}"
+                    " being set to True"
+                ) from exc
+            raise
+        except Exception as exc:
+            if self.never_fail:
+                raise AirflowSkipException(
+                    "Skipping due to never_fail being set to True"
+                ) from exc
+            raise
+        resolved = self._resolved
+        if resolved is None:  # Defensive: poke() always records it
+            raise YellowDogException("The sensor did not resolve its resource")
+        object_id, namespace, name = resolved
+        if reached:
+            return object_id
+
+        spec = self._wait_spec()
+        timeout = float(self.timeout)
+        self.defer(
+            trigger=YellowDogStateTrigger(
+                connection_id=resolve(self.connection_id, "connection_id"),
+                kind=spec.kind,
+                resource_id=object_id,
+                target_states=[cast(str, s.value) for s in spec.target_states],
+                failure_states=[cast(str, s.value) for s in spec.failure_states],
+                poke_interval=self.poke_interval,
+                end_time=time.time() + timeout,
+            ),
+            method_name="execute_complete",
+            kwargs={"namespace": namespace, "name": name},
+            timeout=timedelta(seconds=timeout),
+        )
+
+    def execute_complete(
+        self,
+        context: Context,
+        event: dict[str, Any],
+        namespace: str | None = None,
+        name: str | None = None,
+    ) -> str:
+        """
+        Resume after the trigger fires. Returns the resource ID if a target
+        state was reached; raises :exc:`.YellowDogStateError` for a failure
+        state, ``AirflowSensorTimeout`` on timeout and
+        :exc:`.YellowDogException` for an error in the triggerer (see
+        :class:`.YellowDogSensor` for ``soft_fail`` and ``never_fail``).
+
+        :param event: the :class:`.YellowDogStateTrigger` event
+        :param namespace: the resource's namespace, if known (set by ``execute``)
+        :param name: the resource's name, if known (set by ``execute``)
+        """
+        status = event.get("status")
+        resource_id = cast(str, event["resource_id"]) if "resource_id" in event else ""
+        message = str(event.get("message", ""))
+        if status == "target":
+            self.log.info(message)
+            return resource_id
+        if status in ("failure", "timeout"):
+            if self.soft_fail or self.never_fail:
+                raise AirflowSkipException(
+                    f"Skipping due to {'soft_fail' if self.soft_fail else 'never_fail'}"
+                    f" being set to True: {message}"
+                )
+            if status == "timeout":
+                raise AirflowSensorTimeout(message)
+            spec = self._wait_spec()
+            raise YellowDogStateError(
+                kind=spec.object_type.value,
+                resource_id=resource_id,
+                current_state=spec.status_type(event["state"]),
+                target_states=spec.target_states,
+                namespace=namespace,
+                name=name,
+            )
+        if self.never_fail:
+            raise AirflowSkipException(
+                f"Skipping due to never_fail being set to True: {message}"
+            )
+        error_type = event.get("error_type")
+        if status == "error":
+            raise YellowDogException(
+                message if error_type is None else f"{message} ({error_type})"
+            )
+        raise YellowDogException(f"Unexpected trigger event status '{status}': {event}")
 
     def check_status(
         self,
@@ -114,6 +270,7 @@ class YellowDogSensor(BaseSensorOperator):
         failure states.
         """
 
+        self._resolved = (object_id, namespace, name)
         if not self.xcom_written:
             self.log.info(f"Writing {object_type.value} ID to XCom key '{XCOM_KEY}'")
             context["task_instance"].xcom_push(key=XCOM_KEY, value=object_id)  # type: ignore[typeddict-item]
@@ -147,42 +304,6 @@ class YellowDogSensor(BaseSensorOperator):
             f"waiting for {self.poke_interval} seconds"
         )
         return False
-
-
-def _require_states[S: Enum](
-    field_name: str, status_type: type[S], states: Sequence[S]
-) -> None:
-    for state in states:
-        if not isinstance(state, status_type):
-            raise YellowDogArgumentError(
-                f"'{field_name}' must contain only {status_type.__name__} values; "
-                f"got {state!r}"
-            )
-
-
-def _resolve_states[S: Enum](
-    status_type: type[S],
-    target_states: Sequence[S],
-    failure_states: Sequence[S] | None,
-    final_states: Sequence[S],
-) -> list[S]:
-    """
-    Validate the target and failure states and return the failure states:
-    as given, or (if None) every final state that is not a target state.
-    """
-    if not target_states:
-        raise YellowDogArgumentError("'target_states' must not be empty")
-    _require_states("target_states", status_type, target_states)
-    if failure_states is None:
-        return [state for state in final_states if state not in target_states]
-    _require_states("failure_states", status_type, failure_states)
-    overlap = [state for state in failure_states if state in target_states]
-    if overlap:
-        names = ", ".join(f"'{state.value}'" for state in overlap)
-        raise YellowDogArgumentError(
-            f"'target_states' and 'failure_states' overlap: {names}"
-        )
-    return list(failure_states)
 
 
 class WorkRequirementStateSensor(YellowDogSensor):
@@ -220,7 +341,12 @@ class WorkRequirementStateSensor(YellowDogSensor):
     :type work_requirement_name: str | Callable | None
     :param poke_interval: the time between sensor checks in seconds (default = 60)
     :type poke_interval: float
+    :param deferrable: defer to the triggerer after an initial check; see
+        :class:`YellowDogSensor` (default: Airflow's ``default_deferrable`` setting)
+    :type deferrable: bool | None
     """
+
+    operator_extra_links: Collection[BaseOperatorLink] = (WorkRequirementPortalLink(),)
 
     template_fields: Collection[str] = (
         *YellowDogSensor.template_fields,
@@ -240,11 +366,11 @@ class WorkRequirementStateSensor(YellowDogSensor):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        failure_states_ = _resolve_states(
-            WorkRequirementStatus,
+        _, resolved_failures = resolve_states(
             target_states,
             failure_states,
             WORK_REQUIREMENT_FINAL_STATES,
+            "work requirement",
         )
         require_id_or_name(
             "work requirement",
@@ -256,7 +382,16 @@ class WorkRequirementStateSensor(YellowDogSensor):
         self.namespace = namespace
         self.work_requirement_name = work_requirement_name
         self.target_states = target_states
-        self.failure_states: list[WorkRequirementStatus] = failure_states_
+        self.failure_states: list[WorkRequirementStatus] = list(resolved_failures)
+
+    def _wait_spec(self) -> _WaitSpec:
+        return _WaitSpec(
+            ResourceKind.WORK_REQUIREMENT,
+            ObjectName.WORK_REQUIREMENT,
+            WorkRequirementStatus,
+            self.target_states,
+            self.failure_states,
+        )
 
     def poke(self, context: Context) -> bool:
         """
@@ -319,7 +454,12 @@ class WorkerPoolStateSensor(YellowDogSensor):
     :type worker_pool_name: str | Callable | None
     :param poke_interval: the time between sensor checks in seconds (default = 60)
     :type poke_interval: float
+    :param deferrable: defer to the triggerer after an initial check; see
+        :class:`YellowDogSensor` (default: Airflow's ``default_deferrable`` setting)
+    :type deferrable: bool | None
     """
+
+    operator_extra_links: Collection[BaseOperatorLink] = (WorkerPoolPortalLink(),)
 
     template_fields: Collection[str] = (
         *YellowDogSensor.template_fields,
@@ -339,8 +479,8 @@ class WorkerPoolStateSensor(YellowDogSensor):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        failure_states_ = _resolve_states(
-            WorkerPoolStatus, target_states, failure_states, WORKER_POOL_FINAL_STATES
+        _, resolved_failures = resolve_states(
+            target_states, failure_states, WORKER_POOL_FINAL_STATES, "worker pool"
         )
         require_id_or_name(
             "worker pool",
@@ -352,7 +492,16 @@ class WorkerPoolStateSensor(YellowDogSensor):
         self.namespace = namespace
         self.worker_pool_name = worker_pool_name
         self.target_states = target_states
-        self.failure_states: list[WorkerPoolStatus] = failure_states_
+        self.failure_states: list[WorkerPoolStatus] = list(resolved_failures)
+
+    def _wait_spec(self) -> _WaitSpec:
+        return _WaitSpec(
+            ResourceKind.WORKER_POOL,
+            ObjectName.WORKER_POOL,
+            WorkerPoolStatus,
+            self.target_states,
+            self.failure_states,
+        )
 
     def poke(self, context: Context) -> bool:
         """
@@ -413,6 +562,9 @@ class ComputeRequirementStateSensor(YellowDogSensor):
     :type compute_requirement_name: str | Callable | None
     :param poke_interval: the time between sensor checks in seconds (default = 60)
     :type poke_interval: float
+    :param deferrable: defer to the triggerer after an initial check; see
+        :class:`YellowDogSensor` (default: Airflow's ``default_deferrable`` setting)
+    :type deferrable: bool | None
     """
 
     template_fields: Collection[str] = (
@@ -433,11 +585,11 @@ class ComputeRequirementStateSensor(YellowDogSensor):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        failure_states_ = _resolve_states(
-            ComputeRequirementStatus,
+        _, resolved_failures = resolve_states(
             target_states,
             failure_states,
             COMPUTE_REQUIREMENT_FINAL_STATES,
+            "compute requirement",
         )
         require_id_or_name(
             "compute requirement",
@@ -452,7 +604,16 @@ class ComputeRequirementStateSensor(YellowDogSensor):
         self.namespace = namespace
         self.compute_requirement_name = compute_requirement_name
         self.target_states = target_states
-        self.failure_states: list[ComputeRequirementStatus] = failure_states_
+        self.failure_states: list[ComputeRequirementStatus] = list(resolved_failures)
+
+    def _wait_spec(self) -> _WaitSpec:
+        return _WaitSpec(
+            ResourceKind.COMPUTE_REQUIREMENT,
+            ObjectName.COMPUTE_REQUIREMENT,
+            ComputeRequirementStatus,
+            self.target_states,
+            self.failure_states,
+        )
 
     def poke(self, context: Context) -> bool:
         """

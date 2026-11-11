@@ -10,8 +10,14 @@ All operators live in ``yellowdog_provider.operators.yellowdog_operators``::
        AddWorkRequirement,
        CancelWorkRequirement,
        ProvisionWorkerPool,
+       RunWorkRequirement,
        ShutdownProvisionedWorkerPool,
    )
+
+For most DAGs you need three of them: ``ProvisionWorkerPool`` as a setup
+task, ``RunWorkRequirement`` for the work, and ``ShutdownProvisionedWorkerPool``
+as the teardown. :doc:`workflow` explains how they fit together, and what
+they do about deferral, retries and clean-up; this page lists every argument.
 
 .. contents:: On this page
    :local:
@@ -44,17 +50,32 @@ on). ``task_id`` (``str``) is required for every operator; like the other
 **Return values and XCom.** Each operator returns the YellowDog ID (or IDs) of
 the resource it acted on. With Airflow's default ``do_xcom_push=True`` this is
 stored as the task's XCom (key ``return_value``), so downstream tasks can use
-``"{{ ti.xcom_pull(task_ids='<task_id>') }}"``.
+``"{{ ti.xcom_pull(task_ids='<task_id>') }}"``. Operators that wait
+(``RunWorkRequirement``, ``ProvisionWorkerPool`` with ``wait_until_ready``,
+``ShutdownProvisionedWorkerPool`` with ``wait``) also push the ID to XCom
+before they start waiting, whatever ``do_xcom_push`` is.
+
+**Waiting and deferral.** The waiting operators take ``poke_interval``,
+``timeout`` and ``deferrable``. With ``deferrable=True`` they check once, then
+hand the wait to Airflow's triggerer, freeing the worker slot;
+``deferrable`` defaults to Airflow's ``[operators] default_deferrable``
+setting. See :ref:`deferral`.
+
+**Portal links.** ``RunWorkRequirement``, ``AddWorkRequirement`` and
+``AddPopulatedWorkRequirement`` show a *YellowDog work requirement* link, and
+``ProvisionWorkerPool`` and ``ShutdownProvisionedWorkerPool`` a *YellowDog
+worker pool* link, to the resource in the YellowDog Portal; see
+:doc:`connections`.
 
 **Examples.** The examples below assume these imports (and the operator
-imports above), and this helper, which builds a YellowDog-safe name
-(lower-case letters, digits, ``-`` and ``_``, at most 60 characters) that is
-unique to the DAG run::
+imports above), and this helper, which builds a valid YellowDog name (at most
+60 characters, only lower-case letters, digits, ``_`` or ``-``, starting with
+a letter and ending with a letter or digit) that is unique to the DAG run;
+``prefix`` must start with a letter::
 
    import re
    from datetime import timedelta
 
-   from airflow.sdk import TriggerRule
    from yellowdog_client.model import (
        AutoShutdown,
        ComputeRequirementTemplateUsage,
@@ -63,12 +84,14 @@ unique to the DAG run::
        Task,
        TaskGroup,
        WorkRequirement,
+       WorkRequirementStatus,
    )
 
 
    def unique_name(context, prefix):
        name = f"{prefix}-{context['run_id']}".lower()
-       return re.sub(r"[^a-z0-9_-]", "-", name)[:60]
+       # Ends with a letter or digit even when shortened
+       return re.sub(r"[^a-z0-9_-]", "-", name)[:60].rstrip("-_")
 
 .. _id-or-name:
 
@@ -91,11 +114,122 @@ name:
   :ref:`none-ids`).
 - Looking up a name that does not exist fails with the SDK's ``404`` error.
 
-**Errors.** Errors returned by YellowDog are raised by the SDK and are not
-caught (with the one exception noted for
-:ref:`CancelWorkRequirement <cancel-work-requirement>`); they fail the Airflow
-task, which is then retried according to its ``retries`` setting. See
+**Errors.** Errors returned by YellowDog are raised by the SDK and fail the
+Airflow task, which is then retried according to its ``retries`` setting. The
+provider tolerates only these: a cancellation, pool shutdown or compute
+requirement termination that YellowDog rejects because it has already
+happened (an "invalid transition"); and, while an operator waits, up to three
+consecutive :ref:`transient errors <transient-errors>`. See
 :doc:`troubleshooting`.
+
+RunWorkRequirement
+------------------
+
+Submits a work requirement with its task groups and tasks, then waits until
+it reaches a target state (by default ``COMPLETED``). It fails at once if the
+work requirement reaches a failure state (by default ``FAILED`` or
+``CANCELLED``). It is the operator to use for most work: it is safe to retry,
+and it cancels its work requirement if it gives up. See :doc:`workflow`.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 26 18 10 10
+
+   * - Parameter
+     - Type
+     - Default
+     - Jinja
+     - Callable
+   * - ``work_requirement``
+     - ``WorkRequirement``
+     - required
+     - n/a
+     - yes
+   * - ``task_groups_and_tasks``
+     - ``list[tuple[TaskGroup, list[Task]]]``
+     - required
+     - n/a
+     - yes
+   * - ``target_states``
+     - ``Sequence[WorkRequirementStatus]``
+     - ``(COMPLETED,)``
+     - no
+     - no
+   * - ``failure_states``
+     - ``Sequence[WorkRequirementStatus] | None``
+     - ``None``: the final states (``COMPLETED``, ``FAILED``,
+       ``CANCELLED``) not in ``target_states``
+     - no
+     - no
+   * - ``poke_interval``
+     - ``float`` (seconds)
+     - ``60``
+     - no
+     - no
+   * - ``timeout``
+     - ``float`` (seconds)
+     - ``604800`` (7 days)
+     - no
+     - no
+   * - ``deferrable``
+     - ``bool | None``
+     - ``None``: Airflow's ``[operators] default_deferrable``
+     - no
+     - no
+   * - ``connection_id``
+     - ``str``
+     - ``"yellowdog_default"``
+     - yes
+     - yes
+
+``work_requirement`` must not contain task groups; supply them, in order, as
+``(task_group, tasks)`` pairs in ``task_groups_and_tasks``. If its ``name`` is
+empty, a name is derived from the DAG, run and task (for a mapped task, leave
+it empty: derived names are unique per map index, whereas concurrent map
+indices with the same fixed name can all fail on the duplicate). Its ``tag`` is replaced
+by the run stamp. ``target_states`` and ``failure_states`` follow the same
+rules as the sensors' (:ref:`failure states <failure-states>`): non-empty
+targets, no overlap, ``WorkRequirementStatus`` values only, and ``[]``
+disables failure detection.
+
+**Returns:** the ID of the work requirement (``str``), which is also pushed to
+XCom as soon as it is submitted.
+
+**Retries and kill:** submission is retry-safe. A retry resumes this task's
+earlier work requirement if it is unfinished, returns it if it completed
+(unless the task instance was cleared since), and otherwise submits a fresh
+copy named ``<name>-try<N>``. A work requirement with the same name from
+another task or run is never touched. If the wait times out or fails with an
+error, or the task is killed, the work requirement is cancelled, aborting its
+running tasks; so is a work requirement whose submission fails partway; a
+task killed while deferred is cleaned up on Airflow 3.3 and later only. See :ref:`safe-retries` and :ref:`cancellation`.
+
+**Fails if:** the work requirement reaches a failure state
+(:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError`,
+not retried); the wait times out
+(:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.WaitTimeoutError`,
+retried); ``work_requirement`` has preset task groups
+(:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError`);
+or YellowDog returns an error.
+
+Example::
+
+   def make_wr(context, jinja_env):
+       return WorkRequirement(namespace=context["params"]["namespace"], name="")
+
+   def make_groups_and_tasks(context, jinja_env):
+       spec = RunSpecification(taskTypes=["docker"], workerTags=["my-tag"])
+       task = Task(name="task-1", taskType="docker", arguments=["hello-world"])
+       return [(TaskGroup(name="group-1", runSpecification=spec), [task])]
+
+   run = RunWorkRequirement(
+       task_id="run",
+       work_requirement=make_wr,
+       task_groups_and_tasks=make_groups_and_tasks,
+       target_states=[WorkRequirementStatus.COMPLETED],
+       timeout=6 * 3600,
+       deferrable=True,
+   )
 
 AddWorkRequirement
 ------------------
@@ -126,9 +260,17 @@ Submits a work requirement. Task groups and tasks can then be added with
 
 **Returns:** the ID of the new work requirement (``str``).
 
-**Fails if:** YellowDog rejects the work requirement, for example because a
-work requirement with the same name already exists in the namespace (which
-happens on a retry or re-run if the name does not vary per run).
+**Retries and kill:** the work requirement is tagged with the task's run
+stamp. A retry (or re-run after a clear) returns this task's earlier work
+requirement if it is unfinished or completed in the current clear cycle;
+otherwise a new one is added. If the name is held by a work requirement of
+another task or run, the new one gets a suffixed name (``<name>-try<N>``, with
+a short hash if needed) rather than failing; downstream operators that look
+the work requirement up by namespace and name should therefore use the ID
+from XCom instead. If the task is killed, the work
+requirement is cancelled, aborting running tasks (best effort).
+
+**Fails if:** YellowDog rejects the work requirement.
 
 Example::
 
@@ -187,6 +329,11 @@ already has. Identify the work requirement by ID or by namespace and name
 **Returns:** the IDs of the added task groups (``list[str]``), in the order the
 task groups were supplied. Task groups that were already on the work
 requirement are not included.
+
+**Retries and kill:** the groups are appended to the work requirement's
+current ones in a single update, so a retry after that update succeeded (but
+the task still failed) fails on the duplicate group names. Nothing is
+cancelled if the task is killed.
 
 **Fails if:** the work requirement cannot be found, or YellowDog rejects the
 update.
@@ -260,6 +407,11 @@ ignored, without a warning.
 
 **Returns:** the IDs of the added tasks (``list[str]``).
 
+**Retries and kill:** tasks are added without checking for earlier ones, so a
+retry after a partial failure may add some tasks twice. Use
+``AddPopulatedWorkRequirement`` for
+retry-safe submission. Nothing is cancelled if the task is killed.
+
 **Fails if:** the task group cannot be found, or YellowDog rejects the
 tasks.
 
@@ -312,10 +464,15 @@ group's tasks.
 
 **Fails if:** the work requirement has preset ``taskGroups``
 (:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError`, raised when the task runs, before anything is
-sent to YellowDog), or YellowDog rejects any step. Because the work
-requirement is created first, a failure in a later step leaves a partly
-populated work requirement on the platform, and a retry with the same name
-will then fail as a duplicate; see :doc:`troubleshooting`.
+sent to YellowDog), or YellowDog rejects any step.
+
+**Retries and kill:** submission is retry-safe, exactly as for
+:class:`~yellowdog_provider.operators.yellowdog_operators.RunWorkRequirement`: the work requirement is
+tagged with the task's run stamp, a retry resumes this task's earlier, fully
+built work requirement or submits a fresh copy named ``<name>-try<N>`` (never
+failing on a duplicate name), and a work requirement with the same name
+submitted by another task or run is left alone. If the task is killed, its
+work requirement is cancelled, aborting running tasks (best effort).
 
 Example: see the :doc:`quickstart`.
 
@@ -370,8 +527,10 @@ aborted as well.
 **Already finished.** If YellowDog rejects the cancellation as an invalid state
 transition (for example, the work requirement has already completed or been
 cancelled), the operator logs a warning and succeeds. This makes it safe to
-use as a teardown task with ``trigger_rule=TriggerRule.ALL_DONE``. Any other
-error from YellowDog fails the task.
+use as a teardown task. Any other error from YellowDog fails the task.
+(``ShutdownProvisionedWorkerPool`` already cancels the DAG run's unfinished
+work requirements, so a separate cancel task is needed only for work that is
+not run on a pool the DAG shuts down.)
 
 **Returns:** the ID of the work requirement (``str``).
 
@@ -381,14 +540,14 @@ Example::
        task_id="cancel-wr",
        work_requirement_id="{{ ti.xcom_pull(task_ids='add-wr') }}",
        abort_running_tasks=True,
-       trigger_rule=TriggerRule.ALL_DONE,
-   )
+   ).as_teardown(setups=add_wr)
 
 ProvisionWorkerPool
 -------------------
 
 Provisions a worker pool, and the compute requirement behind it, from a
-compute requirement template.
+compute requirement template and, with ``wait_until_ready=True``, waits until
+the pool is ready for work. Use it as the setup task of :doc:`workflow`.
 
 .. list-table::
    :header-rows: 1
@@ -409,6 +568,26 @@ compute requirement template.
      - ``None``
      - n/a
      - yes
+   * - ``wait_until_ready``
+     - ``bool``
+     - ``False``
+     - no
+     - no
+   * - ``poke_interval``
+     - ``float`` (seconds)
+     - ``30``
+     - no
+     - no
+   * - ``timeout``
+     - ``float`` (seconds)
+     - ``3600``
+     - no
+     - no
+   * - ``deferrable``
+     - ``bool | None``
+     - ``None``: Airflow's ``[operators] default_deferrable``
+     - no
+     - no
    * - ``connection_id``
      - ``str``
      - ``"yellowdog_default"``
@@ -427,13 +606,35 @@ the example DAG ``yd-provider-test.py`` does.
 limits, workers per node and idle shutdown timers; if omitted, YellowDog's
 defaults apply.
 
-**Returns:** the ID of the new worker pool (``str``). The pool may still be
-starting when the operator returns; follow it with a
-:ref:`WorkerPoolStateSensor <worker-pool-state-sensor>` waiting for ``IDLE``
-or ``RUNNING`` if later tasks need the pool to be up.
+**wait_until_ready.** With ``False`` (the default), the operator returns as
+soon as the pool has been provisioned; the pool may still be starting, so
+follow it with a :ref:`WorkerPoolStateSensor <worker-pool-state-sensor>`
+waiting for ``IDLE`` or ``RUNNING`` if later tasks need it. With ``True``, the
+operator pushes the pool's ID to XCom, then waits (every ``poke_interval``
+seconds, for at most ``timeout`` seconds, polling or deferred) until the
+pool is ``IDLE`` or ``RUNNING``: its workers have registered. ``EMPTY``,
+``PENDING`` and ``CONFIGURING`` are not ready. ``poke_interval``, ``timeout``
+and ``deferrable`` are used only with ``wait_until_ready=True``.
+
+**Returns:** the ID of the new worker pool (``str``).
+
+**Retries and kill:** with ``wait_until_ready=True``, a pool that does not
+become ready is cleaned up: if the wait fails (failure state, timeout or
+error) or the task is killed while it waits, the pool is shut down and its
+compute requirement terminated before the task fails (best effort). A task
+killed while deferred is cleaned up only on Airflow 3.3 and later, and a
+worker crash is not cleaned up at all, so a retry then provisions a second
+pool: give the pool an idle shutdown as a backstop (see :ref:`cancellation`).
+Once the pool is ready, or without ``wait_until_ready``, the operator never
+touches it again; the teardown shuts it down. The pool is not run-stamped, so
+a retry always provisions a new pool.
 
 **Fails if:** YellowDog rejects the request (for example, an unknown template
-or image family).
+or image family); with ``wait_until_ready``, the pool reaches ``SHUTDOWN`` or
+``TERMINATED`` before it is ready
+(:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError`)
+or is not ready within ``timeout``
+(:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.WaitTimeoutError`).
 
 **Instance userdata.** A script run when each instance boots is set with the
 SDK's ``ComputeRequirementTemplateUsage(userData=...)`` field, which the
@@ -458,14 +659,18 @@ Example::
            workerTag="my-tag",
            idlePoolShutdown=AutoShutdown(enabled=True, timeout=timedelta(minutes=10)),
        ),
-   )
+       wait_until_ready=True,
+       timeout=30 * 60,
+   ).as_setup()
 
 ShutdownProvisionedWorkerPool
 -----------------------------
 
 Shuts down a provisioned worker pool: no further tasks are given to its
 workers, and tasks already running are allowed to finish. Identify the pool by
-ID or by namespace and name (:ref:`rules <id-or-name>`).
+ID or by namespace and name (:ref:`rules <id-or-name>`). Use it as the
+teardown task of :doc:`workflow`. First, by default, it cancels the DAG run's
+unfinished work requirements.
 
 .. list-table::
    :header-rows: 1
@@ -496,6 +701,31 @@ ID or by namespace and name (:ref:`rules <id-or-name>`).
      - ``False``
      - no
      - no
+   * - ``cancel_run_work_requirements``
+     - ``bool``
+     - ``True``
+     - no
+     - no
+   * - ``wait``
+     - ``bool``
+     - ``False``
+     - no
+     - no
+   * - ``poke_interval``
+     - ``float`` (seconds)
+     - ``30``
+     - no
+     - no
+   * - ``timeout``
+     - ``float`` (seconds)
+     - ``3600``
+     - no
+     - no
+   * - ``deferrable``
+     - ``bool | None``
+     - ``None``: Airflow's ``[operators] default_deferrable``
+     - no
+     - no
    * - ``connection_id``
      - ``str``
      - ``"yellowdog_default"``
@@ -506,18 +736,48 @@ ID or by namespace and name (:ref:`rules <id-or-name>`).
 compute requirement is also terminated straight away, so its instances are
 stopped and any tasks still running on them fail.
 
+**cancel_run_work_requirements.** With ``True`` (the default), before shutting
+the pool down the operator cancels, with abort, every unfinished work
+requirement submitted by any task of the *same DAG run*, in every namespace
+the credentials can see. It recognises them by the run stamp in their tag, so
+other runs' work and work not submitted by the provider are never touched.
+Failures are logged and the shutdown goes ahead. **The cancellation covers
+the whole DAG run, from any task:** set this to ``False`` when other pool
+scopes or other work run concurrently in the same DAG run (for example a CPU
+pool and a GPU pool each with their own setup and teardown, or a
+``RunWorkRequirement`` on an existing pool in a parallel branch); otherwise
+the first teardown to run aborts the other branch's work. See
+:ref:`teardown-cancellation`, and set :ref:`deployment_id <deployment-id>` if
+several Airflow environments share the YellowDog account.
+
+**wait.** With ``wait=True``, the operator pushes the pool ID to XCom, then
+waits until the pool is ``SHUTDOWN`` or ``TERMINATED`` and, with
+``terminate_immediately``, until its compute requirement is ``TERMINATED``.
+``timeout`` covers both waits together. ``poke_interval``, ``timeout`` and
+``deferrable`` are used only with ``wait=True``.
+
+**Already shut down.** A pool that is already shut down, or a compute
+requirement that is already terminating or terminated, is logged and treated
+as success (the operator still terminates the compute requirement and waits,
+as asked), so a teardown after an idle shutdown, or a retried teardown,
+succeeds. If the shutdown fails for another reason, the compute requirement
+is still terminated (with ``terminate_immediately``), then the task fails.
+
 **Returns:** the ID of the worker pool (``str``).
 
 **Fails if:** the pool cannot be found (SDK ``404``), or the pool is not a
 provisioned worker pool. A configured worker pool, or any other pool type,
 raises
 :class:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException`
-without changing the pool.
+without changing the pool or cancelling anything. With ``wait``, also if the
+wait times out
+(:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.WaitTimeoutError`).
 
-Example, as a teardown task::
+Example, as the teardown of the ``provision-pool`` setup task above::
 
    shutdown = ShutdownProvisionedWorkerPool(
        task_id="shutdown-pool",
        worker_pool_id="{{ ti.xcom_pull(task_ids='provision-pool') }}",
-       trigger_rule=TriggerRule.ALL_DONE,
-   )
+       terminate_immediately=True,
+       wait=True,
+   ).as_teardown(setups=provision)

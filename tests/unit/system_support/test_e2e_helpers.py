@@ -1,14 +1,24 @@
 """Offline tests for the e2e test's helpers (no Docker, network or platform)."""
 
+import importlib.util
+import re
 import subprocess
 from pathlib import Path
-from typing import Any
+from types import ModuleType, SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 import tests.system.test_example_dag_e2e as e2e
 from tests.system.config import load_config
 from tests.system.test_example_dag_e2e import (
+    DAG_ID,
+    FAILURE,
+    KILL,
+    MAIN,
+    REPO_ROOT,
+    AirflowContainer,
+    AirflowTarget,
     _airflow_targets,
     _container_name,
     _dag_conf,
@@ -22,7 +32,13 @@ from tests.system.test_example_dag_e2e import (
     _target_ui_port,
     _ui_access_message,
     _ui_port_args,
+    dag_first_wr_name,
+    dag_pool_name,
+    dag_run_tag_prefix,
+    run_tasks_deferred,
+    supports_trigger_kill,
 )
+from yellowdog_provider.utils.run_stamp import RunStamp
 
 NOISY = (
     "2026-11-10T16:27:09.167943Z [warning  ] Could not import graphviz. "
@@ -218,3 +234,148 @@ def test_install_env_selects_constraints_without_sdk_pin() -> None:
     assert _install_env(high)["YD_CONSTRAINTS_URL"].endswith(
         "constraints-3.4.0/constraints-3.12.txt"
     )
+
+
+def test_dag_conf_defaults_not_deferrable_and_takes_overrides(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[platform]\nkey_id = "k"\nkey_secret = "s"\n'
+        '[resources]\nnamespace = "ns"\ncompute_requirement_template = "t"\n'
+        'image_family = "f"\n'
+    )
+    cfg = load_config(path)
+    assert _dag_conf(cfg)["deferrable"] is False
+    conf = _dag_conf(cfg, deferrable=True, task_arguments=["alpine", "false"])
+    assert conf["deferrable"] is True
+    assert conf["task_arguments"] == ["alpine", "false"]
+
+
+def _provider_test_dag() -> ModuleType:
+    path = REPO_ROOT / "yellowdog_provider" / "example_dags" / "yd-provider-test.py"
+    spec = importlib.util.spec_from_file_location("yd_provider_test_e2e", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+TAG = "systest-20261110-090807-abcdef"
+
+
+NAME_RE = re.compile(r"[a-z](?:[a-z0-9_-]{0,58}[a-z0-9])?")
+RUN_IDS = [
+    *(
+        f"{label}-{scenario}-{TAG}"
+        for label in ("min", "max", "3.2.1", "3.10.12")
+        for scenario in (MAIN, FAILURE, KILL)
+    ),
+    f"{TAG}-max",
+    "manual__2026-11-10T12:00:00+00:00",
+    "manual__",
+    "x" * 31 + "-" * 5 + "y",  # the 60-character cut lands on "-"
+    "x" * 31 + "_" * 5 + "y",  # ... or on "_"
+    "_" + "9" * 100,
+]
+
+
+@pytest.mark.parametrize("run_id", RUN_IDS)
+def test_dag_names_match_example_dag(run_id: str) -> None:
+    module = _provider_test_dag()
+    ti = SimpleNamespace(dag_id=DAG_ID, run_id=run_id)
+    pool, wr = dag_pool_name(run_id), dag_first_wr_name(run_id)
+    assert pool == module._get_wp_name({"ti": ti})
+    assert wr == module._get_wr_name({"ti": ti}, "a-")
+    assert NAME_RE.fullmatch(pool), pool
+    assert NAME_RE.fullmatch(wr), wr
+
+
+def test_dag_run_tag_prefix_matches_run_stamp() -> None:
+    ti = SimpleNamespace(
+        dag_id=DAG_ID,
+        run_id=f"{TAG}-min",
+        task_id="run-work-requirement-2",
+        map_index=-1,
+    )
+    stamp = RunStamp.from_context(cast(Any, {"ti": ti}))
+    assert dag_run_tag_prefix(f"{TAG}-min") == stamp.run_tag_prefix()
+
+
+def test_scenario_pool_names_distinct() -> None:
+    names = set()
+    for label in ("min", "max"):
+        target = AirflowTarget(label, 0, "3.4.0")
+        container = AirflowContainer(
+            name="c",
+            target=target,
+            run_tag=TAG,
+            config=cast(Any, None),
+            sweep_run_tag_prefixes=[],
+            sweep_name_fragments=[],
+        )
+        for scenario in (MAIN, FAILURE, KILL):
+            names.add(dag_pool_name(container.run_id(scenario)))
+    assert len(names) == 6
+    assert all(len(n) <= 60 for n in names)
+
+
+def test_main_pool_names_distinct_across_explicit_versions() -> None:
+    names = {
+        dag_pool_name(
+            AirflowContainer(
+                "c", AirflowTarget(label, 0), TAG, cast(Any, None), [], []
+            ).run_id(MAIN)
+        )
+        for label in ("3.2.1", "3.2.10", "3.4.0", "min", "max")
+    }
+    assert len(names) == 5
+
+
+RUN = ["run-work-requirement-1", "run-work-requirement-2"]
+
+
+def test_run_tasks_deferred_waits_then_succeeds() -> None:
+    assert not run_tasks_deferred({}, None, RUN)
+    states = {"provision-worker-pool": "running"}
+    assert not run_tasks_deferred(states, None, RUN)
+    states = {
+        "provision-worker-pool": "success",
+        RUN[0]: "deferred",
+        RUN[1]: "running",
+    }
+    assert not run_tasks_deferred(states, None, RUN)
+    states[RUN[1]] = "deferred"
+    assert run_tasks_deferred(states, None, RUN)
+
+
+@pytest.mark.parametrize("state", ["failed", "success", "upstream_failed", "skipped"])
+def test_run_tasks_deferred_fails_fast_on_terminal_task(state: str) -> None:
+    states = {"provision-worker-pool": "success", RUN[0]: "deferred", RUN[1]: state}
+    with pytest.raises(AssertionError, match="ended before deferring"):
+        run_tasks_deferred(states, None, RUN)
+
+
+@pytest.mark.parametrize("state", ["failed", "upstream_failed", "skipped"])
+def test_run_tasks_deferred_fails_fast_on_setup_failure(state: str) -> None:
+    with pytest.raises(AssertionError, match="Setup task"):
+        run_tasks_deferred({"provision-worker-pool": state}, None, RUN)
+
+
+def test_run_tasks_deferred_fails_fast_when_run_finished() -> None:
+    with pytest.raises(AssertionError, match="DAG run finished"):
+        run_tasks_deferred({}, "failed", RUN)
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("3.1.0", False),
+        ("3.2.9", False),
+        ("3.3.0", True),
+        ("3.4.0", True),
+        (None, False),
+    ],
+)
+def test_supports_trigger_kill(version: str | None, expected: bool) -> None:
+    assert supports_trigger_kill(version) is expected

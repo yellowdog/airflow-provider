@@ -4,12 +4,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 from airflow.sdk import Connection
 from requests.exceptions import HTTPError
-from yellowdog_client.model import RunSpecification, Task, TaskGroup, WorkRequirement
+from yellowdog_client.model import (
+    RunSpecification,
+    Task,
+    TaskGroup,
+    WorkRequirement,
+    WorkRequirementStatus,
+)
 from yellowdog_client.model.exceptions import InvalidRequestException
 
 from tests.support import make_context, render
+from tests.unit.hooks.test_hook_operations import FakePlatform
 from yellowdog_provider.exceptions.yellowdog_exceptions import YellowDogArgumentError
-from yellowdog_provider.hooks.yellowdog_hooks import YellowDogHook
+from yellowdog_provider.hooks.yellowdog_hooks import YellowDogHook, attempt_tag
 from yellowdog_provider.operators import yellowdog_operators as ops
 from yellowdog_provider.operators.yellowdog_operators import (
     AddPopulatedWorkRequirement,
@@ -18,6 +25,15 @@ from yellowdog_provider.operators.yellowdog_operators import (
     AddWorkRequirement,
     CancelWorkRequirement,
 )
+from yellowdog_provider.utils.run_stamp import RunStamp
+
+S = WorkRequirementStatus
+STAMP = RunStamp("test_dag", "test_run", "test_task", -1)
+
+
+@pytest.fixture
+def platform(mock_client: MagicMock) -> FakePlatform:
+    return FakePlatform(mock_client)
 
 
 def _with(obj: Any, **attrs: Any) -> Any:
@@ -57,27 +73,25 @@ def test_positional_args_rejected() -> None:
         AddWorkRequirement("t", _wr())  # type: ignore[misc]
 
 
-def test_add_work_requirement_returns_id(mock_client: MagicMock) -> None:
-    mock_client.work_client.add_work_requirement.return_value = _wr(id="wr-1")
+def test_add_work_requirement_returns_id(platform: FakePlatform) -> None:
     op = AddWorkRequirement(task_id="t", work_requirement=_wr())
-    assert _run(op) == "wr-1"
+    wr_id = _run(op)
+    assert platform.by_id[wr_id].name == "wr"
 
 
-def test_add_work_requirement_accepts_callable(mock_client: MagicMock) -> None:
+def test_add_work_requirement_accepts_callable(platform: FakePlatform) -> None:
     seen: dict[str, Any] = {}
 
     def gen(*, context: Any, jinja_env: Any) -> WorkRequirement:
         seen.update(context=context, jinja_env=jinja_env)
         return _wr()
 
-    mock_client.work_client.add_work_requirement.return_value = _wr(id="wr-2")
     op = AddWorkRequirement(task_id="t", work_requirement=gen)
-    assert _run(op) == "wr-2"
+    assert _run(op) in platform.by_id
     assert seen["context"] is not None and seen["jinja_env"] is not None
 
 
-def test_connection_id_templated(mock_client: MagicMock) -> None:
-    mock_client.work_client.add_work_requirement.return_value = _wr(id="x")
+def test_connection_id_templated(platform: FakePlatform) -> None:
     op = AddWorkRequirement(
         task_id="t", connection_id="{{ params.conn }}", work_requirement=_wr()
     )
@@ -154,30 +168,150 @@ def test_add_populated_rejects_preset_task_groups(mock_client: MagicMock) -> Non
     mock_client.work_client.add_work_requirement.assert_not_called()
 
 
-def test_add_populated_adds_groups_then_tasks(mock_client: MagicMock) -> None:
-    mock_client.work_client.add_work_requirement.side_effect = lambda wr: wr
-    mock_client.work_client.update_work_requirement.side_effect = lambda wr: wr
-    mock_client.work_client.get_work_requirement_by_id.return_value = None
+def test_add_populated_adds_groups_then_tasks(platform: FakePlatform) -> None:
     g1, g2 = _tg("g1"), _tg("g2")
     t1, t2 = [_task()], [_task(), _task()]
     pairs = [(g1, t1), (g2, t2)]
-    wr = _wr(id="wr-9")
     op = AddPopulatedWorkRequirement(
-        task_id="t", work_requirement=wr, task_groups_and_tasks=pairs
+        task_id="t", work_requirement=_wr(), task_groups_and_tasks=pairs
     )
-    assert _run(op) == "wr-9"
+    wr_id = _run(op)
 
-    update = mock_client.work_client.update_work_requirement
+    work = platform.client.work_client
+    assert platform.by_id[wr_id].name == "wr"
+    assert platform.by_id[wr_id].tag == attempt_tag(STAMP, 0)
+    update = work.update_work_requirement
     update.assert_called_once()
     sent = update.call_args.args[0].taskGroups
-    assert sent == [g1, g2]  # submitted in the order supplied
+    assert [g.name for g in sent] == ["g1", "g2"]  # in the order supplied
 
-    calls = mock_client.work_client.add_tasks_to_task_group_by_name.call_args_list
-    assert [c.args for c in calls] == [
-        ("ns", "wr", "g1", t1),
-        ("ns", "wr", "g2", t2),
+    calls = work.add_tasks_to_task_group_by_name.call_args_list
+    assert [(c.args[:3], len(c.args[3])) for c in calls] == [
+        (("ns", "wr", "g1"), 1),
+        (("ns", "wr", "g2"), 2),
     ]
     assert pairs == [(g1, t1), (g2, t2)]  # input list not mutated
+
+
+def test_add_populated_retry_after_failure_uses_try_name(
+    platform: FakePlatform,
+) -> None:
+    platform.existing("wr", STAMP, S.FAILED, cycle=0)
+    op = AddPopulatedWorkRequirement(
+        task_id="t", work_requirement=_wr(), task_groups_and_tasks=[(_tg("g1"), [])]
+    )
+    wr_id = _run(op, try_number=2)
+    assert platform.by_id[wr_id].name == "wr-try2"
+
+
+def test_add_populated_retry_resumes_existing(platform: FakePlatform) -> None:
+    old = platform.existing("wr", STAMP, S.RUNNING, groups=(("g1", 0),), cycle=0)
+    op = AddPopulatedWorkRequirement(
+        task_id="t", work_requirement=_wr(), task_groups_and_tasks=[(_tg("g1"), [])]
+    )
+    assert _run(op, try_number=2) == old.id
+    platform.client.work_client.add_work_requirement.assert_not_called()
+
+
+def test_add_populated_name_owned_by_other_run(platform: FakePlatform) -> None:
+    other = RunStamp("test_dag", "other_run", "test_task", -1)
+    platform.existing("wr", other, S.RUNNING, cycle=0)
+    op = AddPopulatedWorkRequirement(
+        task_id="t", work_requirement=_wr(), task_groups_and_tasks=[(_tg("g1"), [])]
+    )
+    wr_id = _run(op)
+    assert platform.by_id[wr_id].name != "wr"
+    assert platform.by_id["old-1"].taskGroups is not None  # untouched
+    platform.client.work_client.cancel_work_requirement_by_id.assert_not_called()
+
+
+def test_add_populated_already_completed_returns_existing(
+    platform: FakePlatform,
+) -> None:
+    old = platform.existing("wr", STAMP, S.COMPLETED, groups=(("g1", 0),), cycle=0)
+    op = AddPopulatedWorkRequirement(
+        task_id="t", work_requirement=_wr(), task_groups_and_tasks=[(_tg("g1"), [])]
+    )
+    assert _run(op, try_number=2) == old.id
+    platform.client.work_client.add_work_requirement.assert_not_called()
+
+
+def test_add_populated_completed_earlier_cycle_fresh_copy(
+    platform: FakePlatform,
+) -> None:
+    old = platform.existing("wr", STAMP, S.COMPLETED, groups=(("g1", 0),), cycle=0)
+    op = AddPopulatedWorkRequirement(
+        task_id="t", work_requirement=_wr(), task_groups_and_tasks=[(_tg("g1"), [])]
+    )
+    wr_id = _run(op, try_number=2, max_tries=2)
+    assert wr_id != old.id
+    assert platform.by_id[wr_id].name == "wr-try2"
+
+
+def test_add_populated_on_kill_noop_before_submit() -> None:
+    op = AddPopulatedWorkRequirement(
+        task_id="t", work_requirement=_wr(), task_groups_and_tasks=[]
+    )
+    with patch.object(YellowDogHook, "cancel_work_requirement") as cancel:
+        op.on_kill()
+    cancel.assert_not_called()
+
+
+def test_add_populated_on_kill_cancels(platform: FakePlatform) -> None:
+    op = AddPopulatedWorkRequirement(
+        task_id="t", work_requirement=_wr(), task_groups_and_tasks=[]
+    )
+    wr_id = _run(op)
+    with patch.object(YellowDogHook, "cancel_work_requirement") as cancel:
+        op.on_kill()
+    cancel.assert_called_once_with(wr_id, abort=True)
+
+
+def test_on_kill_noop_before_submit() -> None:
+    op = AddWorkRequirement(task_id="t", work_requirement=_wr())
+    with patch.object(YellowDogHook, "cancel_work_requirement") as cancel:
+        op.on_kill()
+    cancel.assert_not_called()
+
+
+def test_add_work_requirement_retry_returns_existing_id(
+    platform: FakePlatform,
+) -> None:
+    old = platform.existing("wr", STAMP, S.RUNNING, groups=(("g1", 3),), cycle=0)
+    op = AddWorkRequirement(task_id="t", work_requirement=_wr())
+    assert _run(op, try_number=2) == old.id
+    platform.client.work_client.add_work_requirement.assert_not_called()
+    platform.client.work_client.cancel_work_requirement_by_id.assert_not_called()
+
+
+def test_add_work_requirement_tags_with_attempt_tag(platform: FakePlatform) -> None:
+    op = AddWorkRequirement(task_id="t", work_requirement=_wr())
+    wr_id = _run(op, max_tries=2)
+    assert platform.by_id[wr_id].tag == attempt_tag(STAMP, 2)
+    assert platform.by_id[wr_id].name == "wr"
+
+
+def test_add_work_requirement_name_owned_by_other_run(platform: FakePlatform) -> None:
+    platform.existing("wr", RunStamp("test_dag", "other", "test_task", -1), S.RUNNING)
+    op = AddWorkRequirement(task_id="t", work_requirement=_wr())
+    wr_id = _run(op)
+    assert platform.by_id[wr_id].name != "wr"
+
+
+def test_add_work_requirement_failed_earlier_attempt_gets_fresh_name(
+    platform: FakePlatform,
+) -> None:
+    platform.existing("wr", STAMP, S.CANCELLED, cycle=0)
+    op = AddWorkRequirement(task_id="t", work_requirement=_wr())
+    assert platform.by_id[_run(op, try_number=2)].name == "wr-try2"
+
+
+def test_add_work_requirement_on_kill_cancels(platform: FakePlatform) -> None:
+    op = AddWorkRequirement(task_id="t", work_requirement=_wr())
+    wr_id = _run(op)
+    with patch.object(YellowDogHook, "cancel_work_requirement") as cancel:
+        op.on_kill()
+    cancel.assert_called_once_with(wr_id, abort=True)
 
 
 def test_cancel_tolerates_invalid_transition(mock_client: MagicMock) -> None:
@@ -236,6 +370,10 @@ def test_id_rendering_to_None_raises(mock_client: MagicMock) -> None:
 
 def test_hook_closed_after_execute(yd_connection: Connection) -> None:
     client = MagicMock(name="client")
+    client.work_client.get_work_requirements.return_value.list_all.return_value = []
+    client.work_client.get_work_requirement_by_name.side_effect = HTTPError(
+        response=MagicMock(status_code=404)
+    )
     client.work_client.add_work_requirement.side_effect = RuntimeError("boom")
     op = AddWorkRequirement(
         task_id="t", connection_id="yd_test", work_requirement=_wr()

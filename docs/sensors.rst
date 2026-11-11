@@ -14,6 +14,12 @@ the resource's status is one of the ``target_states`` you give. It fails at
 once if the status is one of its ``failure_states`` instead: by default, the
 final states (from which the resource never moves) that are not targets.
 
+The waiting operators (``RunWorkRequirement``, and ``ProvisionWorkerPool``
+and ``ShutdownProvisionedWorkerPool`` with their ``wait_until_ready`` and
+``wait`` options) wait for their own resources, so DAGs built from them
+(:doc:`workflow`) need no sensors. Use a sensor to wait for a resource that
+another task, or something outside the DAG, created (:doc:`step-by-step`).
+
 .. contents:: On this page
    :local:
    :depth: 1
@@ -25,7 +31,6 @@ Common behaviour
 
 **Examples** on this page assume these imports::
 
-   from airflow.sdk import TriggerRule
    from yellowdog_client.model import (
        ComputeRequirementStatus,
        WorkerPoolStatus,
@@ -54,6 +59,11 @@ task. As well as the parameters listed for each sensor, every sensor takes:
      - ``60``
      - no
      - no
+   * - ``deferrable``
+     - ``bool | None``
+     - ``None``: Airflow's ``[operators] default_deferrable``
+     - no
+     - no
 
 and all the standard Airflow ``BaseSensorOperator`` arguments, notably:
 
@@ -67,7 +77,18 @@ and all the standard Airflow ``BaseSensorOperator`` arguments, notably:
   the usual ``BaseOperator`` arguments such as ``retries`` and
   ``trigger_rule``.
 
-The provider's sensors do not support deferrable mode.
+**Deferrable mode.** With ``deferrable=True``, the sensor checks the resource
+once on the worker (looking it up, pushing its ID to XCom, and succeeding or
+failing at once if it is already in a target or failure state). Otherwise it
+defers to Airflow's triggerer, which checks the state every
+``poke_interval`` seconds without holding a worker slot, until a target
+state, a failure state, or ``timeout`` seconds after the sensor started.
+``deferrable`` defaults to Airflow's ``[operators] default_deferrable``
+setting (``False`` unless changed), and needs a running triggerer; see
+:ref:`deferral`. A deferrable sensor ignores ``mode="reschedule"``, and
+``exponential_backoff`` and ``max_wait`` do not apply to the triggerer's
+polling. While deferred, up to three consecutive :ref:`transient errors
+<transient-errors>` are tolerated.
 
 The *Jinja* and *Callable* columns have the same meaning as in
 :doc:`operators`. ``target_states`` and ``failure_states`` are fixed when the
@@ -138,8 +159,38 @@ change).
 
 **Failure states and the fail arguments.** ``silent_fail=True`` does not
 suppress a failure state: the task still fails. ``soft_fail=True`` or
-``never_fail=True`` turns a failure state into a skipped task, as for a
-timeout.
+``never_fail=True`` turns a failure state into a skipped task.
+
+The fail arguments in deferrable mode:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 25 25 25
+
+   * - Outcome
+     - ``soft_fail=True``
+     - ``never_fail=True``
+     - ``silent_fail=True``
+   * - Failure state
+     - skipped
+     - skipped
+     - fails
+   * - Timeout
+     - skipped
+     - **skipped** (when polling: fails with ``AirflowSensorTimeout``)
+     - fails
+   * - Error (in the first check, or reported by the triggerer)
+     - fails
+     - skipped
+     - fails (there is no later poke to retry)
+
+So the only difference from a polling sensor is a timeout with
+``never_fail=True``, which skips a deferred sensor but fails a polling one,
+and ``silent_fail``, which has no effect when deferred.
+
+**Portal links.** ``WorkRequirementStateSensor`` and ``WorkerPoolStateSensor``
+show a link to their resource in the YellowDog Portal; see
+:doc:`connections`.
 
 **XCom.** On its first poke, each sensor pushes the resolved resource ID to
 XCom under the key ``return_value``. This happens regardless of
@@ -152,10 +203,11 @@ fails at once rather than waiting for the next poke; it is then retried
 according to its ``retries``. If the resource may not exist yet when the
 sensor starts, either start the sensor after the task that creates it, or set
 ``silent_fail=True`` so that errors are logged and poking continues (failure
-states still fail the task; see above).
+states still fail the task; see above). ``silent_fail`` does not apply to a
+deferred sensor; its triggerer tolerates only transient errors.
 
 **Timeouts.** If neither a target state nor a failure state is reached
-within ``timeout``, Airflow fails the sensor with ``AirflowSensorTimeout``.
+within ``timeout``, the sensor fails with ``AirflowSensorTimeout``.
 
 WorkRequirementStateSensor
 --------------------------
@@ -324,7 +376,9 @@ in the ``ComputeRequirementTemplateUsage`` used to provision it.
 ``ComputeRequirementStatus`` values: ``NEW``, ``PROVISIONING``, ``STARTING``,
 ``RUNNING``, ``STOPPING``, ``STOPPED``, ``TERMINATING``, ``TERMINATED``.
 
-Example, confirming that instances have gone after a teardown::
+Example, confirming that a compute requirement's instances have gone
+(``ShutdownProvisionedWorkerPool`` with ``terminate_immediately=True`` and
+``wait=True`` does this for its own pool)::
 
    wait_for_termination = ComputeRequirementStateSensor(
        task_id="wait-for-termination",
@@ -332,5 +386,4 @@ Example, confirming that instances have gone after a teardown::
        compute_requirement_name="{{ params.pool_name }}",
        target_states=[ComputeRequirementStatus.TERMINATED],
        timeout=30 * 60,
-       trigger_rule=TriggerRule.ALL_DONE,
    )

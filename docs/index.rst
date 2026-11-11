@@ -10,11 +10,23 @@ premises.
 The provider contains:
 
 - a **Hook** (``YellowDogHook``) and a ``yellowdog`` **Connection type** that
-  keep your YellowDog Application credentials in Airflow's connection store;
-- **Operators** that submit and cancel YellowDog work requirements, and
-  provision and shut down YellowDog worker pools;
+  keep your YellowDog Application credentials in Airflow's connection store,
+  with typed operations for use in your own ``@task`` functions;
+- **Operators** that provision a worker pool, run work on it and shut it
+  down (the three-task pattern in :doc:`workflow`), plus finer-grained
+  operators that submit and cancel work requirements step by step;
 - **Sensors** that wait for a work requirement, worker pool or compute
-  requirement to reach one of a set of states.
+  requirement to reach one of a set of states;
+- a **Trigger**, so that the operators and sensors can *defer* their waits
+  to Airflow's triggerer instead of holding a worker slot;
+- **Portal links** from Airflow tasks to the YellowDog Portal.
+
+The operators that submit work requirements (``RunWorkRequirement``,
+``AddWorkRequirement`` and ``AddPopulatedWorkRequirement``) are safe to
+retry: a retry carries on with the earlier attempt's work instead of
+duplicating it (for the other operators, see :ref:`safe-retries`). Work is
+cancelled, with running tasks aborted, if a task gives up, is killed, or the
+DAG run's teardown finds it still running.
 
 Operators and sensors take objects from the `YellowDog Python SDK
 <https://pypi.org/project/yellowdog-sdk>`_ (``WorkRequirement``, ``TaskGroup``,
@@ -38,10 +50,6 @@ Requirements
 - A YellowDog account, and an Application (key ID and secret) with permission
   to use the namespaces your DAGs work in
 
-Python versions earlier than 3.12 are not supported: on those versions every
-``yellowdog-sdk`` release requires ``urllib3<2``, which conflicts with
-Airflow's constraint files.
-
 Installation
 ------------
 
@@ -64,8 +72,12 @@ Check that Airflow has found the provider::
    :maxdepth: 2
    :caption: Contents
 
+   Overview <self>
    concepts
    quickstart
+   workflow
+   step-by-step
+   taskflow
    connections
    operators
    sensors

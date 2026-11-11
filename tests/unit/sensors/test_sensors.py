@@ -3,6 +3,7 @@ import importlib
 import inspect
 import pickle
 import warnings
+from datetime import timedelta
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,15 @@ from yellowdog_provider.sensors.yellowdog_sensors import (
     ComputeRequirementStateSensor,
     WorkerPoolStateSensor,
     WorkRequirementStateSensor,
+)
+from yellowdog_provider.triggers.yellowdog_triggers import (
+    ResourceKind,
+    YellowDogStateTrigger,
+)
+from yellowdog_provider.utils.airflow_compat import (
+    AirflowSensorTimeout,
+    AirflowSkipException,
+    TaskDeferred,
 )
 
 
@@ -427,3 +437,233 @@ def test_poke_log_lists_failure_states(case: Case, mock_client: MagicMock) -> No
         _poke(op)
     messages = " ".join(str(c.args[0]) for c in log.info.call_args_list)
     assert f"failure states {[s.value for s in case.default_failures]}" in messages
+
+
+# --- Deferrable mode ---
+
+KINDS = {
+    "work_requirement": ResourceKind.WORK_REQUIREMENT,
+    "worker_pool": ResourceKind.WORKER_POOL,
+    "compute_requirement": ResourceKind.COMPUTE_REQUIREMENT,
+}
+SENSORS_MODULE = "yellowdog_provider.sensors.yellowdog_sensors"
+
+
+def _event(case: Case, status: str, state: Any, **extra: Any) -> dict[str, Any]:
+    return {
+        "status": status,
+        "kind": KINDS[case.prefix].value,
+        "resource_id": "obj-1",
+        "state": None if state is None else state.value,
+        "message": "the message",
+        **extra,
+    }
+
+
+def _deferrable(case: Case, **kw: Any) -> Any:
+    return case.make(deferrable=True, **{f"{case.prefix}_id": "obj-1"}, **kw)
+
+
+@cases
+def test_sensor_defers_when_deferrable(case: Case, mock_client: MagicMock) -> None:
+    case.setup(mock_client, case.other)
+    op = _deferrable(case, poke_interval=30, timeout=600, connection_id="my_conn")
+    ctx = _ctx()
+    render(op, ctx)
+    with patch(f"{SENSORS_MODULE}.time") as clock:
+        clock.time.return_value = 1000.0
+        with pytest.raises(TaskDeferred) as info:
+            op.execute(ctx)
+    trigger = info.value.trigger
+    assert isinstance(trigger, YellowDogStateTrigger)
+    assert trigger.serialize()[1] == {
+        "connection_id": "my_conn",
+        "kind": KINDS[case.prefix].value,
+        "resource_id": "obj-1",
+        "target_states": [case.reached.value],
+        "failure_states": [s.value for s in case.default_failures],
+        "poke_interval": 30.0,
+        "end_time": 1600.0,
+    }
+    assert info.value.method_name == "execute_complete"
+    assert info.value.timeout == timedelta(seconds=600)
+    push = cast(MagicMock, cast(Any, ctx)["task_instance"].xcom_push)
+    push.assert_called_once_with(key="return_value", value="obj-1")
+
+
+@cases
+def test_sensor_deferrable_returns_immediately_if_target(
+    case: Case, mock_client: MagicMock
+) -> None:
+    case.setup(mock_client, case.reached)
+    op = _deferrable(case)
+    ctx = _ctx()
+    render(op, ctx)
+    assert op.execute(ctx) == "obj-1"
+    cast(Any, ctx)["task_instance"].xcom_push.assert_called_once()
+
+
+@cases
+def test_sensor_deferrable_raises_immediately_on_failure_state(
+    case: Case, mock_client: MagicMock
+) -> None:
+    case.setup(mock_client, case.failed)
+    op = _deferrable(case)
+    ctx = _ctx()
+    render(op, ctx)
+    with pytest.raises(YellowDogStateError):
+        op.execute(ctx)
+
+
+@cases
+def test_deferrable_lookup_by_name(case: Case, mock_client: MagicMock) -> None:
+    case.setup(mock_client, case.other)
+    op = case.make(
+        deferrable=True,
+        namespace="ns",
+        **{f"{case.prefix}_name": "nm"},
+    )
+    ctx = _ctx()
+    render(op, ctx)
+    with pytest.raises(TaskDeferred) as info:
+        op.execute(ctx)
+    assert info.value.trigger.serialize()[1]["resource_id"] == "obj-1"  # type: ignore[union-attr]
+
+
+@cases
+def test_non_deferrable_execute_unchanged(case: Case, mock_client: MagicMock) -> None:
+    case.setup(mock_client, case.reached)
+    op = case.make(**{f"{case.prefix}_id": "obj-1"})
+    ctx = _ctx()
+    render(op, ctx)
+    assert op.deferrable is False
+    assert op.execute(ctx) is None
+
+
+@cases
+def test_execute_complete_target_returns_id(case: Case) -> None:
+    op = _deferrable(case)
+    assert op.execute_complete(_ctx(), _event(case, "target", case.reached)) == "obj-1"
+
+
+@cases
+def test_execute_complete_failure_raises_state_error(case: Case) -> None:
+    op = _deferrable(case)
+    with pytest.raises(YellowDogStateError) as info:
+        op.execute_complete(
+            _ctx(),
+            _event(case, "failure", case.failed),
+            namespace="ns",
+            name="nm",
+        )
+    err = info.value
+    assert err.resource_id == "obj-1"
+    assert err.current_state == case.failed
+    assert err.namespace == "ns"
+    assert err.name == "nm"
+    assert str(case.reached.value) in str(err)
+
+
+@cases
+def test_execute_complete_timeout_raises_sensor_timeout(case: Case) -> None:
+    op = _deferrable(case)
+    with pytest.raises(AirflowSensorTimeout, match="the message"):
+        op.execute_complete(_ctx(), _event(case, "timeout", case.other))
+
+
+@cases
+def test_execute_complete_error_raises_yellowdog_exception(case: Case) -> None:
+    op = _deferrable(case)
+    with pytest.raises(YellowDogException, match="the message") as info:
+        op.execute_complete(_ctx(), _event(case, "error", None, error_type="HTTPError"))
+    assert "HTTPError" in str(info.value)
+    assert not isinstance(info.value, YellowDogStateError)
+
+
+@cases
+def test_execute_complete_unknown_status_raises(case: Case) -> None:
+    op = _deferrable(case)
+    with pytest.raises(YellowDogException, match="bogus"):
+        op.execute_complete(_ctx(), _event(case, "bogus", None))
+
+
+@cases
+def test_deferred_soft_fail_skips_on_failure_and_timeout(case: Case) -> None:
+    op = _deferrable(case, soft_fail=True)
+    with pytest.raises(AirflowSkipException):
+        op.execute_complete(_ctx(), _event(case, "failure", case.failed))
+    with pytest.raises(AirflowSkipException):
+        op.execute_complete(_ctx(), _event(case, "timeout", case.other))
+    with pytest.raises(YellowDogException) as info:
+        op.execute_complete(_ctx(), _event(case, "error", None, error_type="X"))
+    assert not isinstance(info.value, AirflowSkipException)
+
+
+@cases
+def test_deferred_never_fail_skips_on_everything(case: Case) -> None:
+    op = _deferrable(case, never_fail=True)
+    for event in (
+        _event(case, "failure", case.failed),
+        _event(case, "timeout", case.other),
+        _event(case, "error", None, error_type="X"),
+    ):
+        with pytest.raises(AirflowSkipException):
+            op.execute_complete(_ctx(), event)
+
+
+@cases
+def test_deferred_initial_check_honours_soft_and_never_fail(
+    case: Case, mock_client: MagicMock
+) -> None:
+    case.setup(mock_client, case.failed)
+    for flag in ("soft_fail", "never_fail"):
+        op = _deferrable(case, **{flag: True})
+        ctx = _ctx()
+        render(op, ctx)
+        with pytest.raises(AirflowSkipException):
+            op.execute(ctx)
+
+
+@cases
+def test_deferred_initial_check_never_fail_skips_on_lookup_error(
+    case: Case, mock_client: MagicMock
+) -> None:
+    api = case.setup(mock_client, case.other)
+    getattr(api, f"get_{case.getter}_by_id").side_effect = RuntimeError("boom")
+    ctx = _ctx()
+    op = _deferrable(case, never_fail=True)
+    render(op, ctx)
+    with pytest.raises(AirflowSkipException):
+        op.execute(ctx)
+    op = _deferrable(case)
+    render(op, ctx)
+    with pytest.raises(RuntimeError):
+        op.execute(ctx)
+
+
+@cases
+def test_deferrable_takes_precedence_over_reschedule(
+    case: Case, mock_client: MagicMock
+) -> None:
+    case.setup(mock_client, case.other)
+    op = _deferrable(case, mode="reschedule")
+    ctx = _ctx()
+    render(op, ctx)
+    with pytest.raises(TaskDeferred):
+        op.execute(ctx)
+
+
+@cases
+def test_deferrable_default_follows_airflow_config(case: Case) -> None:
+    for configured in (True, False):
+        with patch(f"{SENSORS_MODULE}.conf") as conf:
+            conf.getboolean.return_value = configured
+            op = case.make(**{f"{case.prefix}_id": "obj-1"})
+        conf.getboolean.assert_called_once_with(
+            "operators", "default_deferrable", fallback=False
+        )
+        assert op.deferrable is configured
+    with patch(f"{SENSORS_MODULE}.conf") as conf:
+        conf.getboolean.return_value = True
+        op = case.make(deferrable=False, **{f"{case.prefix}_id": "obj-1"})
+    assert op.deferrable is False

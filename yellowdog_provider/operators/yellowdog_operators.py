@@ -4,33 +4,57 @@ YellowDog Airflow Operators for managing work requirements and worker pools.
 
 from __future__ import annotations
 
-from collections.abc import Collection
-from typing import Any, cast
+import time
+from collections.abc import Callable, Collection, Sequence
+from datetime import timedelta
+from enum import Enum
+from typing import Any, NoReturn, cast
 
-from airflow.sdk import BaseOperator, Context
-from requests.exceptions import HTTPError
+from airflow.sdk import BaseOperator, BaseOperatorLink, Context
 from yellowdog_client.model import (
+    ComputeRequirementStatus,
     ComputeRequirementTemplateUsage,
     ConfiguredWorkerPool,
     ProvisionedWorkerPool,
     ProvisionedWorkerPoolProperties,
     Task,
     TaskGroup,
+    WorkerPoolStatus,
     WorkRequirement,
     WorkRequirementStatus,
 )
-from yellowdog_client.model.exceptions import BaseCustomException
 
 from yellowdog_provider.exceptions.yellowdog_exceptions import (
+    WaitTimeoutError,
     YellowDogArgumentError,
     YellowDogException,
+    YellowDogStateError,
 )
-from yellowdog_provider.hooks.yellowdog_hooks import YellowDogHook
+from yellowdog_provider.hooks.yellowdog_hooks import (
+    YellowDogHook,
+)
+from yellowdog_provider.links.yellowdog_links import (
+    WorkerPoolPortalLink,
+    WorkRequirementPortalLink,
+)
+from yellowdog_provider.sensors.yellowdog_sensors import (
+    COMPUTE_REQUIREMENT_FINAL_STATES,
+    WORK_REQUIREMENT_FINAL_STATES,
+    WORKER_POOL_FINAL_STATES,
+    XCOM_KEY,
+)
+from yellowdog_provider.triggers.yellowdog_triggers import (
+    ResourceKind,
+    YellowDogStateTrigger,
+)
+from yellowdog_provider.utils.airflow_compat import conf
+from yellowdog_provider.utils.run_stamp import RunStamp
 from yellowdog_provider.utils.templating import (
     Templated,
     resolve,
     resolve_optional_str,
 )
+from yellowdog_provider.utils.waiting import resolve_states, wait_for_state
 from yellowdog_provider.utils.yellowdog_utils import (
     get_work_requirement_by_id_or_name,
     get_worker_pool_by_id_or_name,
@@ -65,7 +89,67 @@ class YellowDogOperator(BaseOperator):
         return YellowDogHook(resolve(self.connection_id, "connection_id"))
 
 
-class AddWorkRequirement(YellowDogOperator):
+class _WorkRequirementSubmitter(YellowDogOperator):
+    """
+    Base class for operators that submit a work requirement: records its ID
+    (for :meth:`on_kill`) and derives the clear cycle.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._work_requirement_id: str | None = None
+
+    def _cycle(self, max_tries: object) -> int:
+        """The clear cycle: the task instance's ``max_tries`` (see above)."""
+        if (
+            isinstance(max_tries, int)
+            and not isinstance(max_tries, bool)
+            and max_tries >= 0
+        ):
+            return max_tries
+        self.log.warning(
+            "The task instance has no usable 'max_tries' (%r); using clear "
+            "cycle 0, so a completed earlier attempt from cycle 0 will not be "
+            "re-run after a clear",
+            max_tries,
+        )
+        return 0
+
+    def on_kill(self) -> None:
+        """
+        Cancels the work requirement this operator submitted or resumed,
+        aborting its running tasks (best-effort: errors are logged, not
+        raised). Does nothing if no work requirement has been submitted yet.
+        """
+        wr_id = self._work_requirement_id
+        if wr_id is None:
+            self.log.info("No work requirement submitted yet; nothing to cancel")
+            return
+        self._cancel(wr_id, "task killed")
+
+    def _cancel(self, wr_id: str, reason: str) -> None:
+        """Best-effort cancel with abort: log failures, never raise."""
+        self.log.warning(
+            "Cancelling work requirement ID '%s', aborting running tasks (%s)",
+            wr_id,
+            reason,
+        )
+        try:
+            with self.get_hook() as hook:
+                hook.cancel_work_requirement(wr_id, abort=True)
+        except Exception:
+            self.log.exception("Failed to cancel work requirement ID '%s'", wr_id)
+
+    def _context_ti(self, context: Context) -> tuple[RunStamp, Any, int]:
+        """The run stamp, task instance and clear cycle of the running task."""
+        stamp = RunStamp.from_context(context)
+        if "ti" not in context:  # Defensive: RunStamp.from_context checks this
+            raise YellowDogException("Task context has no task instance ('ti')")
+        ti = context["ti"]
+        return stamp, ti, self._cycle(getattr(ti, "max_tries", None))
+
+
+class AddWorkRequirement(_WorkRequirementSubmitter):
     """
     Add a YellowDog work requirement to the platform. All arguments are
     keyword-only.
@@ -80,9 +164,19 @@ class AddWorkRequirement(YellowDogOperator):
         Callable that generates a WorkRequirement object (templated)
     :type work_requirement: WorkRequirement | Callable
 
+    The work requirement is tagged with the task's run stamp, so a retry (or
+    a re-run after the task is cleared) returns this task's earlier work
+    requirement instead of failing on a duplicate name, provided that is
+    unfinished (or completed in the current clear cycle); otherwise a new one
+    is added, under a suffixed name if the name is held by another work
+    requirement. If the task is killed, its work requirement is cancelled
+    (best effort), aborting any running tasks.
+
     :return: the YellowDog ID of the added work requirement
     :rtype: str
     """
+
+    operator_extra_links: Collection[BaseOperatorLink] = (WorkRequirementPortalLink(),)
 
     template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
@@ -104,12 +198,20 @@ class AddWorkRequirement(YellowDogOperator):
         """
 
         wr = resolve(self.work_requirement, "work_requirement")
+        stamp, ti, cycle = self._context_ti(context)
         with self.get_hook() as hook:
-            client = hook.get_conn()
-            self.log.info(f"Adding work requirement '{wr.namespace}/{wr.name}'")
-            added = client.work_client.add_work_requirement(wr)
-            self.log.info(f"Added work requirement ID '{added.id}'")
-            return cast(str, added.id)
+            result = hook.add_work_requirement(
+                wr, stamp=stamp, try_number=ti.try_number, cycle=cycle
+            )
+            self._work_requirement_id = result.work_requirement_id
+            self.log.info(
+                "Work requirement '%s/%s' (ID '%s'): %s",
+                wr.namespace,
+                result.name,
+                result.work_requirement_id,
+                result.action.replace("_", " "),
+            )
+            return result.work_requirement_id
 
 
 class AddTaskGroupsToWorkRequirement(YellowDogOperator):
@@ -120,6 +222,11 @@ class AddTaskGroupsToWorkRequirement(YellowDogOperator):
     is treated as not supplied; one that renders to ``"None"`` raises a
     :exc:`.YellowDogArgumentError` (usually a missing upstream XCom value). All
     arguments are keyword-only.
+
+    Retries: the groups are appended to the work requirement's current ones in
+    a single update, so a retry after that update succeeded (but the task still
+    failed) fails on the duplicate group names. The operator does not cancel
+    anything if the task is killed.
 
     :param task_id: the Airflow task ID
     :type task_id: str
@@ -226,6 +333,12 @@ class AddTasksToTaskGroup(YellowDogOperator):
     that renders to an empty string is treated as not supplied; one that
     renders to ``"None"`` raises a :exc:`.YellowDogArgumentError` (usually a missing
     upstream XCom value). All arguments are keyword-only.
+
+    Retries: tasks are added without checking for earlier ones, so a retry
+    after a partial failure may add some tasks twice; use
+    :class:`AddPopulatedWorkRequirement` or :class:`RunWorkRequirement` for
+    retry-safe submission. The operator does not cancel anything if the task
+    is killed.
 
     :param task_id: the Airflow task ID
     :type task_id: str
@@ -343,13 +456,21 @@ class AddTasksToTaskGroup(YellowDogOperator):
             return [cast(str, task_.id) for task_ in added_tasks]
 
 
-class AddPopulatedWorkRequirement(YellowDogOperator):
+class AddPopulatedWorkRequirement(_WorkRequirementSubmitter):
     """
     Add a 'one-shot', populated YellowDog work requirement to the platform,
     including its task groups and tasks. The supplied work requirement must not
     already contain task groups (a :exc:`.YellowDogArgumentError` is raised if it does);
     supply them via task_groups_and_tasks instead. All arguments are
     keyword-only.
+
+    Submission is retry-safe, with the same semantics as
+    :class:`RunWorkRequirement` (see :meth:`.YellowDogHook.submit_work_requirement`):
+    a retry resumes this task's earlier, fully built work requirement or
+    submits a fresh copy named ``<name>-try<N>``. If submission fails
+    partway, the partly built work requirement is cancelled, with abort. If the
+    task is killed, its work requirement is cancelled (best effort), aborting
+    any running tasks.
 
     :param task_id: the Airflow task ID
     :type task_id: str
@@ -367,6 +488,8 @@ class AddPopulatedWorkRequirement(YellowDogOperator):
     :return: the YellowDog ID of the added work requirement
     :rtype: str
     """
+
+    operator_extra_links: Collection[BaseOperatorLink] = (WorkRequirementPortalLink(),)
 
     template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
@@ -402,36 +525,338 @@ class AddPopulatedWorkRequirement(YellowDogOperator):
                 "'task_groups_and_tasks'"
             )
 
+        stamp, ti, cycle = self._context_ti(context)
         with self.get_hook() as hook:
-            client = hook.get_conn()
-
-            self.log.info(f"Adding work requirement '{wr.namespace}/{wr.name}'")
-            added = client.work_client.add_work_requirement(wr)
-            self.log.info(f"Added work requirement ID '{added.id}'")
-
-            task_groups = [task_group for task_group, _ in task_groups_and_tasks]
-            self.log.info(
-                f"Adding {len(task_groups)} task group(s) to work requirement: "
-                f"{[task_group.name for task_group in task_groups]}"
+            result = hook.submit_work_requirement(
+                wr,
+                task_groups_and_tasks,
+                stamp=stamp,
+                try_number=ti.try_number,
+                cycle=cycle,
             )
-            # The platform preserves submission order, so no reversal is
-            # needed; verified by
-            # tests/system/test_components.py::test_add_populated_task_group_order
-            added.taskGroups = task_groups
-            added = client.work_client.update_work_requirement(added)
+            self._work_requirement_id = result.work_requirement_id
+            self.log.info(
+                "Work requirement '%s/%s' (ID '%s'): %s",
+                wr.namespace,
+                result.name,
+                result.work_requirement_id,
+                result.action.replace("_", " "),
+            )
+            return result.work_requirement_id
 
-            for task_group, tasks in task_groups_and_tasks:
-                self.log.info(
-                    f"Adding {len(tasks)} task(s) to task group '{task_group.name}'"
-                )
-                client.work_client.add_tasks_to_task_group_by_name(
-                    added.namespace,
-                    added.name,
-                    task_group.name,
-                    tasks,
-                )
 
-            return cast(str, added.id)
+_WORK_REQUIREMENT = "work requirement"
+
+DEFER_TIMEOUT_GRACE: float = 300
+"""
+Seconds that the deferrable operators (:class:`RunWorkRequirement`,
+:class:`ProvisionWorkerPool`, :class:`ShutdownProvisionedWorkerPool`) add to
+their remaining ``timeout`` for Airflow's own deferral timeout, so that the
+trigger's timeout event (on which the operator cleans up, e.g. cancels its
+work requirement or terminates its unready pool) arrives first. Airflow's
+deferral timeout is only a backstop, e.g. if no triggerer is running; when it
+fires, Airflow fails the task without calling the operator, so the operator
+does not clean up.
+"""
+
+
+class RunWorkRequirement(_WorkRequirementSubmitter):
+    """
+    Run a populated YellowDog work requirement: submit it with its task groups
+    and tasks, wait until it reaches a target state (by default COMPLETED),
+    and fail if it reaches a failure state first. All arguments are
+    keyword-only.
+
+    **Submission is safe across retries.** The work requirement is stamped
+    with this DAG run's and task's identity (in its ``tag``, replacing any tag
+    supplied) and named as supplied or, if the name is empty, after the DAG,
+    task and run. An earlier attempt of this task in this DAG run is resumed
+    (waited on) if it is unfinished, and is not run again if it completed; a
+    failed or cancelled attempt is replaced by a fresh copy named
+    ``<name>-try<N>``. See
+    :meth:`.YellowDogHook.submit_work_requirement` for the full rules. For a
+    mapped task (``expand``), leave ``name`` unset: the derived names are
+    unique per map index, whereas concurrent map indices with the same fixed
+    name can all see it free, and all but one then fail on the duplicate.
+
+    **Clearing re-runs the work.** A completed earlier attempt is submitted
+    again as a fresh copy when the task instance has been *cleared* since it
+    was submitted, but not on an automatic retry. Each submission records the
+    task instance's *clear cycle* in its tag (``<stamp>:c<cycle>``), and the
+    cycle is the task instance's Airflow ``max_tries``: Airflow raises
+    ``max_tries`` (to ``<last try> + retries``) whenever it clears a task
+    instance and leaves it unchanged on retries (verified for Airflow 3.1 and
+    3.4). A completed attempt counts as done only if it was submitted in the
+    current cycle, so work requested by a clear is redone even if the first
+    try after the clear fails before submitting. An unfinished attempt is
+    resumed whatever its cycle. Limitations: Airflow does not tell the task
+    whether it had succeeded, so a clear re-runs a completed work requirement
+    whatever the task instance's earlier outcome was; and on Airflow 3.1, a
+    task instance cleared while running in non-deferrable mode can, in a
+    narrow race, be recorded as failed without ``max_tries`` being raised, in
+    which case its next try is treated as a retry (a completed attempt is not
+    re-run). If the task instance does not expose a usable ``max_tries``,
+    cycle 0 is used (a completed attempt from cycle 0 is then never re-run).
+
+    **The work requirement ID** is pushed to XCom (key ``return_value``) as
+    soon as it is known, before waiting, and is also the operator's return
+    value.
+
+    **Nothing is left running.** If the wait times out (``timeout``) or fails
+    with an error, the work requirement is cancelled, aborting its running
+    tasks, before the task fails; so is it if the task is killed (e.g. marked
+    failed, or by ``execution_timeout``) while this operator runs on a
+    worker. A failure state that the work requirement can leave (one that is
+    not final, if supplied in ``failure_states``) also cancels it.
+    Cancellation is best-effort: a failure to cancel is logged and never
+    hides the original error. A task killed by a user (marked failed or
+    succeeded, or cleared) while deferred is cleaned up by the trigger on
+    Airflow 3.3 and later (verified on 3.4); **on Airflow 3.1 and 3.2,
+    Airflow has no kill hook for deferred tasks, so it is not cleaned up by
+    the provider**. An error while the work requirement is being submitted
+    (after it is created, before all its tasks are added) cancels the partly
+    built work requirement, aborting its tasks, and then fails the task; the
+    only gap is a task killed in the moment between the work requirement's
+    creation and the operator recording its ID (inside the submission),
+    which is not cleaned up. For these cases, use a
+    teardown such as :class:`ShutdownProvisionedWorkerPool`, which cancels
+    the DAG run's unfinished work requirements
+    (``cancel_run_work_requirements``).
+
+    :param task_id: the Airflow task ID
+    :type task_id: str
+    :param connection_id: connection to run the operator with (templated) or a
+        Callable that generates the connection ID; defaults to
+        ``yellowdog_default``
+    :type connection_id: str | Callable
+    :param work_requirement: a YellowDog WorkRequirement object, without task
+        groups, or a Callable that generates one (templated)
+    :type work_requirement: WorkRequirement | Callable
+    :param task_groups_and_tasks: a list of (TaskGroup, list of Task) pairs,
+        one per task group, in order, or a Callable that generates the list
+        (templated)
+    :type task_groups_and_tasks: list[tuple[TaskGroup, list[Task]]] | Callable
+    :param target_states: the (non-empty) WorkRequirementStatus states that
+        end the wait successfully; defaults to COMPLETED
+    :type target_states: Sequence[WorkRequirementStatus]
+    :param failure_states: the WorkRequirementStatus states that fail the task
+        at once with :exc:`.YellowDogStateError`. Defaults to the final states
+        (COMPLETED, FAILED and CANCELLED) that are not in ``target_states``;
+        an empty list disables failure detection
+    :type failure_states: Sequence[WorkRequirementStatus] | None
+    :param poke_interval: the time between status checks in seconds
+        (default = 60)
+    :type poke_interval: float
+    :param timeout: the longest time to wait, in seconds, from the start of the
+        wait (default = 7 days); on expiry the work requirement is cancelled
+        and :exc:`.WaitTimeoutError` is raised (Airflow may retry the task,
+        which then submits a fresh copy)
+    :type timeout: float
+    :param deferrable: if true, the operator checks the status once, then
+        defers to the triggerer, which polls every ``poke_interval`` seconds
+        without occupying a worker slot. Defaults to Airflow's ``[operators]
+        default_deferrable`` setting (false unless configured), read when the
+        operator is constructed
+    :type deferrable: bool | None
+
+    :return: the YellowDog ID of the work requirement
+    :rtype: str
+    """
+
+    operator_extra_links: Collection[BaseOperatorLink] = (WorkRequirementPortalLink(),)
+
+    template_fields: Collection[str] = (
+        *YellowDogOperator.template_fields,
+        "work_requirement",
+        "task_groups_and_tasks",
+    )
+
+    def __init__(
+        self,
+        *,
+        work_requirement: Templated[WorkRequirement],
+        task_groups_and_tasks: Templated[list[tuple[TaskGroup, list[Task]]]],
+        target_states: Sequence[WorkRequirementStatus] = (
+            WorkRequirementStatus.COMPLETED,
+        ),
+        failure_states: Sequence[WorkRequirementStatus] | None = None,
+        poke_interval: float = 60,  # Seconds
+        timeout: float = 7 * 24 * 3600,  # Seconds
+        deferrable: bool | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        targets, failures = resolve_states(
+            target_states,
+            failure_states,
+            WORK_REQUIREMENT_FINAL_STATES,
+            _WORK_REQUIREMENT,
+        )
+        self.work_requirement = work_requirement
+        self.task_groups_and_tasks = task_groups_and_tasks
+        self.target_states: list[WorkRequirementStatus] = list(targets)
+        self.failure_states: list[WorkRequirementStatus] = list(failures)
+        self.poke_interval: float = float(poke_interval)
+        self.timeout: float = float(timeout)
+        self.deferrable: bool = (
+            conf.getboolean("operators", "default_deferrable", fallback=False)
+            if deferrable is None
+            else deferrable
+        )
+
+    def execute(self, context: Context) -> str:
+        """
+        Submits (or resumes) the work requirement, pushes its ID to XCom, then
+        waits for it, polling or deferring.
+        """
+
+        wr = resolve(self.work_requirement, "work_requirement")
+        task_groups_and_tasks = resolve(
+            self.task_groups_and_tasks, "task_groups_and_tasks"
+        )
+        stamp, ti, cycle = self._context_ti(context)
+
+        with self.get_hook() as hook:
+            result = hook.submit_work_requirement(
+                wr,
+                task_groups_and_tasks,
+                stamp=stamp,
+                try_number=ti.try_number,
+                cycle=cycle,
+            )
+            wr_id = result.work_requirement_id
+            self._work_requirement_id = wr_id
+            self.log.info(
+                "Work requirement '%s/%s' (ID '%s'): %s",
+                wr.namespace,
+                result.name,
+                wr_id,
+                result.action.replace("_", " "),
+            )
+            try:
+                ti.xcom_push(key=XCOM_KEY, value=wr_id)
+                if (
+                    result.action == "already_completed"
+                    and WorkRequirementStatus.COMPLETED in self.target_states
+                ):
+                    return wr_id
+                if not self.deferrable:
+                    wait_for_state(
+                        lambda: hook.get_work_requirement_state(wr_id),
+                        self.target_states,
+                        self.failure_states,
+                        poke_interval=self.poke_interval,
+                        timeout=self.timeout,
+                        describe=lambda state: self._state_error(
+                            wr_id, state, wr.namespace, result.name
+                        ),
+                        log=self.log,
+                        kind=_WORK_REQUIREMENT,
+                        resource_id=wr_id,
+                    )
+                    return wr_id
+                # Deferrable: check once before deferring
+                state = hook.get_work_requirement_state(wr_id)
+                if state in self.target_states:
+                    self.log.info("Reached status '%s'", state.value)
+                    return wr_id
+                if state in self.failure_states:
+                    raise self._state_error(wr_id, state, wr.namespace, result.name)
+                trigger = YellowDogStateTrigger(
+                    connection_id=resolve(self.connection_id, "connection_id"),
+                    kind=ResourceKind.WORK_REQUIREMENT,
+                    resource_id=wr_id,
+                    target_states=[cast(str, s.value) for s in self.target_states],
+                    failure_states=[cast(str, s.value) for s in self.failure_states],
+                    poke_interval=self.poke_interval,
+                    end_time=time.time() + self.timeout,
+                    kill_action="cancel_work_requirement",
+                )
+            except YellowDogStateError as exc:
+                if not cast(WorkRequirementStatus, exc.current_state).finished:
+                    self._cancel(wr_id, "unfinished failure state")
+                raise
+            except Exception:
+                self._cancel(wr_id, "error while waiting")
+                raise
+
+        self.defer(
+            trigger=trigger,
+            method_name="execute_complete",
+            kwargs={
+                "work_requirement_id": wr_id,
+                "namespace": wr.namespace,
+                "name": result.name,
+            },
+            timeout=timedelta(seconds=self.timeout + DEFER_TIMEOUT_GRACE),
+        )
+
+    def execute_complete(
+        self,
+        context: Context,
+        event: dict[str, Any],
+        work_requirement_id: str | None = None,
+        namespace: str | None = None,
+        name: str | None = None,
+    ) -> str:
+        """
+        Resume after the trigger fires. Returns the work requirement ID if a
+        target state was reached; raises :exc:`.YellowDogStateError` for a
+        failure state, and otherwise cancels the work requirement (aborting
+        running tasks) and raises :exc:`.WaitTimeoutError` on timeout or
+        :exc:`.YellowDogException` for an error in the triggerer.
+
+        :param event: the :class:`.YellowDogStateTrigger` event
+        :param work_requirement_id: the work requirement's ID (set by
+            ``execute``); defaults to the event's resource ID
+        :param namespace: the work requirement's namespace (set by ``execute``)
+        :param name: the work requirement's name (set by ``execute``)
+        """
+        wr_id = work_requirement_id or str(event.get("resource_id", ""))
+        self._work_requirement_id = wr_id
+        status = event.get("status")
+        message = str(event.get("message", ""))
+        if status == "target":
+            self.log.info(message)
+            return wr_id
+        state = self._known_state(event.get("state"))
+        if status == "failure" and state is not None:
+            if not state.finished:
+                self._cancel(wr_id, "unfinished failure state")
+            raise self._state_error(wr_id, state, namespace, name)
+        self._cancel(wr_id, f"trigger event '{status}'")
+        if status == "timeout" and state is not None:
+            raise WaitTimeoutError(_WORK_REQUIREMENT, wr_id, state, self.timeout)
+        if status == "error":
+            error_type = event.get("error_type")
+            raise YellowDogException(
+                message if error_type is None else f"{message} ({error_type})"
+            )
+        raise YellowDogException(f"Unexpected trigger event: {event}")
+
+    @staticmethod
+    def _known_state(raw: object) -> WorkRequirementStatus | None:
+        """The event's state, or ``None`` if absent or not a known status."""
+        try:
+            return None if raw is None else WorkRequirementStatus(raw)
+        except ValueError:
+            return None
+
+    def _state_error(
+        self,
+        wr_id: str,
+        state: WorkRequirementStatus,
+        namespace: str | None,
+        name: str | None,
+    ) -> YellowDogStateError:
+        return YellowDogStateError(
+            kind=_WORK_REQUIREMENT,
+            resource_id=wr_id,
+            current_state=state,
+            target_states=self.target_states,
+            namespace=namespace,
+            name=name,
+        )
 
 
 class CancelWorkRequirement(YellowDogOperator):
@@ -515,29 +940,116 @@ class CancelWorkRequirement(YellowDogOperator):
                 client, self.log, wr_id, namespace, wr_name
             )
 
-            self.log.info(f"Cancelling work requirement ID '{work_requirement.id}'")
-            try:
-                work_requirement = client.work_client.cancel_work_requirement_by_id(
-                    cast(str, work_requirement.id), self.abort_running_tasks
-                )
-            except (HTTPError, BaseCustomException) as e:
-                # Tolerate idempotent cancellations (YEL-13327); the SDK raises
-                # either HTTPError or a BaseCustomException subclass
-                if "invalid transition" in str(e).lower():
-                    status = cast(WorkRequirementStatus, work_requirement.status)
-                    self.log.warning(
-                        "Cancellation invalid for work requirement with status "
-                        f"'{status.value}'"
-                    )
-                else:
-                    raise
-
+            hook.cancel_work_requirement(
+                cast(str, work_requirement.id), abort=self.abort_running_tasks
+            )
             return cast(str, work_requirement.id)
+
+
+_WORKER_POOL = "worker pool"
+_COMPUTE_REQUIREMENT = "compute requirement"
+
+POOL_READY_STATES: tuple[WorkerPoolStatus, ...] = (
+    WorkerPoolStatus.IDLE,
+    WorkerPoolStatus.RUNNING,
+)
+"""
+The worker pool states in which :class:`ProvisionWorkerPool` considers a pool
+ready (its workers have registered). EMPTY, PENDING and CONFIGURING are not
+ready.
+"""
+
+_EVENT_KINDS: dict[str, tuple[str, type[Enum]]] = {
+    ResourceKind.WORKER_POOL.value: (_WORKER_POOL, WorkerPoolStatus),
+    ResourceKind.COMPUTE_REQUIREMENT.value: (
+        _COMPUTE_REQUIREMENT,
+        ComputeRequirementStatus,
+    ),
+}
+
+
+def _push_id(context: Context, resource_id: str) -> None:
+    """Push a resource ID to XCom (key ``return_value``) before waiting."""
+    if "ti" not in context:
+        raise YellowDogException("Task context has no task instance ('ti')")
+    context["ti"].xcom_push(key=XCOM_KEY, value=resource_id)
+
+
+def _default_deferrable(deferrable: bool | None) -> bool:
+    """``deferrable``, or Airflow's ``[operators] default_deferrable`` if None."""
+    if deferrable is None:
+        return conf.getboolean("operators", "default_deferrable", fallback=False)
+    return deferrable
+
+
+def _event_state(event: dict[str, Any]) -> tuple[str, Enum | None]:
+    """
+    The resource kind label and the state of a worker pool or compute
+    requirement trigger event (``None`` if absent or not a known status).
+    """
+    label, status_type = _EVENT_KINDS.get(
+        str(event.get("kind")), (_WORKER_POOL, WorkerPoolStatus)
+    )
+    raw = event.get("state")
+    try:
+        return label, None if raw is None else status_type(raw)
+    except ValueError:
+        return label, None
+
+
+def _event_error(event: dict[str, Any], timeout: float) -> YellowDogException:
+    """
+    The error for a worker pool or compute requirement trigger event that is
+    not a target event: :exc:`.WaitTimeoutError` for a timeout with a known
+    state, otherwise :exc:`.YellowDogException`.
+    """
+    status = event.get("status")
+    message = str(event.get("message", ""))
+    label, state = _event_state(event)
+    if status == "timeout" and state is not None:
+        return WaitTimeoutError(
+            label, str(event.get("resource_id", "")), state, timeout
+        )
+    if status == "error":
+        error_type = event.get("error_type")
+        return YellowDogException(
+            message if error_type is None else f"{message} ({error_type})"
+        )
+    return YellowDogException(f"Unexpected trigger event: {event}")
 
 
 class ProvisionWorkerPool(YellowDogOperator):
     """
-    Provision a YellowDog worker pool. All arguments are keyword-only.
+    Provision a YellowDog worker pool and, optionally, wait until it is
+    ready. All arguments are keyword-only.
+
+    With ``wait_until_ready``, the worker pool ID is pushed to XCom (key
+    ``return_value``) as soon as the pool is provisioned, then the operator
+    waits until the pool is IDLE or RUNNING (its workers have registered).
+    EMPTY, PENDING and CONFIGURING are not ready, so a pool whose instances
+    never come up fails at the ``timeout``; a pool that reaches SHUTDOWN or
+    TERMINATED first fails the task with :exc:`.YellowDogStateError`.
+
+    **The pool cleans up after itself.** If the wait fails (failure state,
+    ``timeout``, or an error), or the task is killed (e.g. marked failed, or
+    by ``execution_timeout``) while this operator waits on a worker, the pool
+    is shut down and its compute requirement terminated before the task
+    fails, so a retry never orphans a pool. Cleanup is best-effort: a failure
+    to clean up is logged and never hides the original error. Once the pool
+    is ready (or if not waiting), killing the task leaves the pool alone: use
+    :class:`ShutdownProvisionedWorkerPool` as the matching teardown.
+
+    A task killed by a user (marked failed or succeeded, or cleared) while
+    deferred is cleaned up by the trigger on Airflow 3.3 and later
+    (verified on 3.4). **On Airflow 3.1 and 3.2, Airflow has no kill hook for
+    deferred tasks, so such a pool is not cleaned up by the provider**, and
+    the teardown does not run either (Airflow skips a teardown whose setup
+    failed). On those versions,
+    give the pool an idle shutdown (``ProvisionedWorkerPoolProperties``) as
+    a backstop, or use ``deferrable=False`` for this task. Likewise, if the
+    worker running this task crashes while waiting, nothing cleans up the
+    pool, and a retry provisions a second one; the pool's idle shutdown is
+    the backstop.
 
     :param task_id: the Airflow task ID
     :type task_id: str
@@ -552,10 +1064,28 @@ class ProvisionWorkerPool(YellowDogOperator):
         or a Callable that generates the object (templated); optional
     :type provisioned_worker_pool_properties: ProvisionedWorkerPoolProperties |
         Callable | None
+    :param wait_until_ready: wait until the pool is IDLE or RUNNING (default
+        ``False``: return as soon as the pool is provisioned)
+    :type wait_until_ready: bool
+    :param poke_interval: the time between status checks in seconds
+        (default = 30)
+    :type poke_interval: float
+    :param timeout: the longest time to wait for the pool to be ready, in
+        seconds (default = 3600); on expiry the pool is terminated and
+        :exc:`.WaitTimeoutError` is raised
+    :type timeout: float
+    :param deferrable: if true, the operator checks the status once, then
+        defers to the triggerer, which polls every ``poke_interval`` seconds
+        without occupying a worker slot. Defaults to Airflow's ``[operators]
+        default_deferrable`` setting (false unless configured), read when the
+        operator is constructed. Only used with ``wait_until_ready``
+    :type deferrable: bool | None
 
     :return: the YellowDog ID of the provisioned worker pool
     :rtype: str
     """
+
+    operator_extra_links: Collection[BaseOperatorLink] = (WorkerPoolPortalLink(),)
 
     template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
@@ -570,15 +1100,26 @@ class ProvisionWorkerPool(YellowDogOperator):
         provisioned_worker_pool_properties: (
             Templated[ProvisionedWorkerPoolProperties] | None
         ) = None,
+        wait_until_ready: bool = False,
+        poke_interval: float = 30,  # Seconds
+        timeout: float = 3600,  # Seconds
+        deferrable: bool | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.compute_requirement_template_usage = compute_requirement_template_usage
         self.provisioned_worker_pool_properties = provisioned_worker_pool_properties
+        self.wait_until_ready: bool = wait_until_ready
+        self.poke_interval: float = float(poke_interval)
+        self.timeout: float = float(timeout)
+        self.deferrable: bool = _default_deferrable(deferrable)
+        self._worker_pool_id: str | None = None
+        self._ready: bool = False  # The pool is handed over: on_kill leaves it
 
     def execute(self, context: Context) -> str:
         """
-        Provisions the worker pool.
+        Provisions the worker pool and, with ``wait_until_ready``, pushes its
+        ID to XCom and waits until it is ready, polling or deferring.
         """
 
         crtu = resolve(
@@ -595,16 +1136,123 @@ class ProvisionWorkerPool(YellowDogOperator):
         )
 
         with self.get_hook() as hook:
-            client = hook.get_conn()
-            self.log.info(
-                "Provisioning worker pool "
-                f"'{crtu.requirementNamespace}/{crtu.requirementName}'"
-            )
-            provisioned_worker_pool = client.worker_pool_client.provision_worker_pool(
-                crtu, pwpp
-            )
-            self.log.info(f"Provisioned worker pool ID '{provisioned_worker_pool.id}'")
-            return cast(str, provisioned_worker_pool.id)
+            pool_id = hook.provision_worker_pool(crtu, pwpp)
+            self._worker_pool_id = pool_id
+            if not self.wait_until_ready:
+                self._ready = True
+                return pool_id
+            try:
+                _push_id(context, pool_id)
+                if not self.deferrable:
+                    wait_for_state(
+                        lambda: hook.get_worker_pool_state(pool_id),
+                        POOL_READY_STATES,
+                        WORKER_POOL_FINAL_STATES,
+                        poke_interval=self.poke_interval,
+                        timeout=self.timeout,
+                        describe=lambda state: self._state_error(pool_id, state),
+                        log=self.log,
+                        kind=_WORKER_POOL,
+                        resource_id=pool_id,
+                    )
+                    self._ready = True
+                    return pool_id
+                # Deferrable: check once before deferring
+                state = hook.get_worker_pool_state(pool_id)
+                if state in POOL_READY_STATES:
+                    self.log.info("Reached status '%s'", state.value)
+                    self._ready = True
+                    return pool_id
+                if state in WORKER_POOL_FINAL_STATES:
+                    raise self._state_error(pool_id, state)
+                trigger = YellowDogStateTrigger(
+                    connection_id=resolve(self.connection_id, "connection_id"),
+                    kind=ResourceKind.WORKER_POOL,
+                    resource_id=pool_id,
+                    target_states=[cast(str, s.value) for s in POOL_READY_STATES],
+                    failure_states=[
+                        cast(str, s.value) for s in WORKER_POOL_FINAL_STATES
+                    ],
+                    poke_interval=self.poke_interval,
+                    end_time=time.time() + self.timeout,
+                    kill_action="terminate_worker_pool",
+                )
+            except Exception:
+                self._terminate(pool_id, "not ready")
+                raise
+
+        self.defer(
+            trigger=trigger,
+            method_name="execute_complete",
+            kwargs={"worker_pool_id": pool_id},
+            timeout=timedelta(seconds=self.timeout + DEFER_TIMEOUT_GRACE),
+        )
+
+    def execute_complete(
+        self,
+        context: Context,
+        event: dict[str, Any],
+        worker_pool_id: str | None = None,
+    ) -> str:
+        """
+        Resume after the trigger fires. Returns the worker pool ID if the pool
+        is ready; otherwise terminates the pool (best-effort) and raises
+        :exc:`.YellowDogStateError` for a failure state,
+        :exc:`.WaitTimeoutError` on timeout or :exc:`.YellowDogException` for
+        an error in the triggerer.
+
+        :param event: the :class:`.YellowDogStateTrigger` event
+        :param worker_pool_id: the worker pool's ID (set by ``execute``);
+            defaults to the event's resource ID
+        """
+        pool_id = worker_pool_id or str(event.get("resource_id", ""))
+        self._worker_pool_id = pool_id
+        status = event.get("status")
+        if status == "target":
+            self.log.info(str(event.get("message", "")))
+            self._ready = True
+            return pool_id
+        self._terminate(pool_id, f"trigger event '{status}'")
+        _, state = _event_state(event)
+        if status == "failure" and isinstance(state, WorkerPoolStatus):
+            raise self._state_error(pool_id, state)
+        raise _event_error(event, self.timeout)
+
+    def on_kill(self) -> None:
+        """
+        Terminates the worker pool if it was provisioned but is not yet ready
+        (best-effort: errors are logged, not raised). A ready pool, or one
+        provisioned without ``wait_until_ready``, is left alone.
+        """
+        pool_id = self._worker_pool_id
+        if pool_id is None or self._ready:
+            self.log.info("No unready worker pool to terminate")
+            return
+        self._terminate(pool_id, "task killed")
+
+    def _terminate(self, pool_id: str, reason: str) -> None:
+        """Best-effort shutdown and terminate: log failures, never raise."""
+        self.log.warning(
+            "Shutting down worker pool ID '%s' and terminating its compute "
+            "requirement (%s)",
+            pool_id,
+            reason,
+        )
+        try:
+            with self.get_hook() as hook:
+                hook.shutdown_worker_pool(pool_id, terminate_immediately=True)
+        except Exception:
+            self.log.exception("Failed to terminate worker pool ID '%s'", pool_id)
+
+    def _state_error(
+        self, pool_id: str, state: WorkerPoolStatus
+    ) -> YellowDogStateError:
+        return YellowDogStateError(
+            kind=_WORKER_POOL,
+            resource_id=pool_id,
+            current_state=state,
+            target_states=POOL_READY_STATES,
+        )
 
 
 class ShutdownProvisionedWorkerPool(YellowDogOperator):
@@ -617,8 +1265,38 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
     to ``"None"`` raises a :exc:`.YellowDogArgumentError` (usually a missing upstream
     XCom value). A configured (or otherwise non-provisioned) worker pool
     raises a
-    :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException`.
+    :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException`
+    (and nothing is cancelled). A pool that is already shut down (the
+    platform rejects the shutdown as an "invalid transition") is tolerated:
+    the operator still terminates the compute requirement (with
+    ``terminate_immediately``), waits (with ``wait``) and succeeds; so is a
+    compute requirement that is already terminating or terminated (e.g. when
+    the teardown is retried). If the
+    shutdown fails for another reason, the compute requirement is still
+    terminated (with ``terminate_immediately``) and the task then fails.
     All arguments are keyword-only.
+
+    **Run-scoped cancellation.** Before shutting the pool down, the operator
+    (with ``cancel_run_work_requirements``, the default) cancels, aborting
+    running tasks, every unfinished work requirement, in any namespace
+    visible to the connection's credentials, that was submitted by any task
+    of *this DAG run* (identified by the run stamp in its ``tag``; see
+    :meth:`~yellowdog_provider.utils.run_stamp.RunStamp.run_tag_prefix`).
+    Work requirements of other DAG runs, or not submitted by this provider,
+    are never touched. If several Airflow deployments share the same
+    YellowDog credentials, give each a distinct ``[yellowdog]
+    deployment_id`` setting, so that runs with the same DAG and run IDs in
+    different deployments are told apart. Used as the
+    teardown of the DAG run's work, this cleans up work left running by
+    killed deferred tasks or crashed workers. Cancellation is best-effort: a
+    failure is logged and the shutdown goes ahead.
+
+    **Waiting.** With ``wait``, the operator pushes the pool ID to XCom (key
+    ``return_value``), waits until the pool is SHUTDOWN or TERMINATED and,
+    with ``terminate_immediately``, then until its compute requirement is
+    TERMINATED. ``timeout`` covers both waits together. When deferrable, each
+    wait is a separate deferral (the compute requirement's deferral starts
+    after the pool's ends) with the same overall deadline.
 
     :param task_id: the Airflow task ID
     :type task_id: str
@@ -638,10 +1316,38 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
     :param terminate_immediately: immediately terminate the associated
         compute requirement, failing any running tasks; defaults to ``False``
     :type terminate_immediately: bool
+    :param wait: wait until the pool (and, with ``terminate_immediately``,
+        its compute requirement) has finished shutting down (default
+        ``False``)
+    :type wait: bool
+    :param poke_interval: the time between status checks in seconds
+        (default = 30)
+    :type poke_interval: float
+    :param timeout: the longest time to wait, in seconds, for both waits
+        together (default = 3600); on expiry :exc:`.WaitTimeoutError` is
+        raised
+    :type timeout: float
+    :param deferrable: if true, each wait checks the status once, then defers
+        to the triggerer. Defaults to Airflow's ``[operators]
+        default_deferrable`` setting (false unless configured), read when the
+        operator is constructed. Only used with ``wait``
+    :type deferrable: bool | None
+    :param cancel_run_work_requirements: first cancel this DAG run's
+        unfinished work requirements, in any namespace (default
+        ``True``). The cancellation covers the whole DAG run, from any task:
+        set this to ``False`` when other pool scopes or other work run
+        concurrently in the same DAG run (for example a CPU pool and a GPU
+        pool each with their own setup and teardown, or a
+        :class:`RunWorkRequirement` on an existing pool in a parallel
+        branch); otherwise the first teardown to run aborts the other
+        branch's work
+    :type cancel_run_work_requirements: bool
 
     :return: the YellowDog ID of the worker pool that was shut down
     :rtype: str
     """
+
+    operator_extra_links: Collection[BaseOperatorLink] = (WorkerPoolPortalLink(),)
 
     template_fields: Collection[str] = (
         *YellowDogOperator.template_fields,
@@ -657,6 +1363,11 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
         namespace: Templated[str] | None = None,
         worker_pool_name: Templated[str] | None = None,
         terminate_immediately: bool = False,
+        wait: bool = False,
+        poke_interval: float = 30,  # Seconds
+        timeout: float = 3600,  # Seconds
+        deferrable: bool | None = None,
+        cancel_run_work_requirements: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -670,11 +1381,17 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
         self.namespace = namespace
         self.worker_pool_name = worker_pool_name
         self.terminate_immediately = terminate_immediately
+        self.wait: bool = wait
+        self.poke_interval: float = float(poke_interval)
+        self.timeout: float = float(timeout)
+        self.deferrable: bool = _default_deferrable(deferrable)
+        self.cancel_run_work_requirements: bool = cancel_run_work_requirements
 
     def execute(self, context: Context) -> str:
         """
-        Shuts down a worker pool and optionally terminates its compute
-        requirement.
+        Cancels this DAG run's unfinished work requirements (if enabled),
+        shuts down the worker pool, optionally terminates its compute
+        requirement, and optionally waits for both.
         """
 
         wp_id = resolve_optional_str(self.worker_pool_id, "worker_pool_id")
@@ -687,35 +1404,209 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
                 client, self.log, wp_id, namespace, wp_name
             )
 
-            if isinstance(worker_pool, ProvisionedWorkerPool):
-                self.log.info(
-                    f"Shutting down provisioned worker pool ID '{worker_pool.id}'"
-                )
-                client.worker_pool_client.shutdown_worker_pool_by_id(
-                    cast(str, worker_pool.id)
-                )
-                self.log.info(f"Shut down worker pool ID '{worker_pool.id}'")
-
-                if self.terminate_immediately:
-                    self.log.info(
-                        "Immediately terminating compute requirement ID "
-                        f"'{worker_pool.computeRequirementId}'"
-                    )
-                    client.compute_client.terminate_compute_requirement_by_id(
-                        cast(str, worker_pool.computeRequirementId)
-                    )
-
-                return cast(str, worker_pool.id)
-
             if isinstance(worker_pool, ConfiguredWorkerPool):
                 raise YellowDogException(
                     f"Worker pool '{worker_pool.namespace}/{worker_pool.name}' "
                     f"({worker_pool.id}) is a configured worker pool"
                 )
+            if not isinstance(worker_pool, ProvisionedWorkerPool):
+                raise YellowDogException(
+                    f"Worker pool '{worker_pool.namespace}/{worker_pool.name}' "
+                    f"({worker_pool.id}) is of unsupported type "
+                    f"'{type(worker_pool).__name__}'; only provisioned worker pools "
+                    "can be shut down"
+                )
 
-            raise YellowDogException(
-                f"Worker pool '{worker_pool.namespace}/{worker_pool.name}' "
-                f"({worker_pool.id}) is of unsupported type "
-                f"'{type(worker_pool).__name__}'; only provisioned worker pools "
-                "can be shut down"
+            pool_id = cast(str, worker_pool.id)
+            if self.cancel_run_work_requirements:
+                self._cancel_run_work_requirements(hook, context)
+
+            cr_id = hook.shutdown_worker_pool(
+                pool_id, terminate_immediately=self.terminate_immediately
             )
+
+            if not self.wait:
+                return pool_id
+
+            _push_id(context, pool_id)
+            if self.deferrable:
+                return self._await_deferred(
+                    hook, pool_id, cr_id, time.time() + self.timeout
+                )
+            deadline = time.monotonic() + self.timeout
+            self._wait_sync(
+                lambda: hook.get_worker_pool_state(pool_id),
+                cast(Sequence[Enum], WORKER_POOL_FINAL_STATES),
+                self.timeout,
+                _WORKER_POOL,
+                pool_id,
+            )
+            if cr_id is not None:
+                try:
+                    self._wait_sync(
+                        lambda: hook.get_compute_requirement_state(cr_id),
+                        cast(Sequence[Enum], COMPUTE_REQUIREMENT_FINAL_STATES),
+                        max(0.0, deadline - time.monotonic()),
+                        _COMPUTE_REQUIREMENT,
+                        cr_id,
+                    )
+                except WaitTimeoutError as exc:  # Report the overall timeout
+                    raise WaitTimeoutError(
+                        exc.kind, exc.resource_id, exc.last_state, self.timeout
+                    ) from exc
+            return pool_id
+
+    def execute_complete(
+        self,
+        context: Context,
+        event: dict[str, Any],
+        worker_pool_id: str | None = None,
+        compute_requirement_id: str | None = None,
+        end_time: float | None = None,
+    ) -> str:
+        """
+        Resume after a trigger fires. After the worker pool's wait, if there
+        is a compute requirement to wait for, checks it and (unless already
+        TERMINATED) defers again; otherwise returns the worker pool ID.
+        Raises :exc:`.WaitTimeoutError` on timeout or
+        :exc:`.YellowDogException` for an error in the triggerer.
+
+        :param event: the :class:`.YellowDogStateTrigger` event
+        :param worker_pool_id: the worker pool's ID (set by ``execute``)
+        :param compute_requirement_id: the compute requirement still to wait
+            for, if any (set by ``execute``)
+        :param end_time: the overall deadline, in seconds since the epoch
+            (set by ``execute``)
+        """
+        pool_id = worker_pool_id or str(event.get("resource_id", ""))
+        if event.get("status") != "target":
+            raise _event_error(event, self.timeout)
+        self.log.info(str(event.get("message", "")))
+        if compute_requirement_id is None:
+            return pool_id
+        deadline = time.time() + self.timeout if end_time is None else end_time
+        with self.get_hook() as hook:
+            return self._await_deferred(
+                hook, pool_id, compute_requirement_id, deadline, pool_done=True
+            )
+
+    def _cancel_run_work_requirements(
+        self, hook: YellowDogHook, context: Context
+    ) -> None:
+        """
+        Best-effort cancel (with abort) of this DAG run's unfinished work
+        requirements in every visible namespace: failures are logged, never
+        raised.
+        """
+        try:
+            prefix = RunStamp.from_context(context).run_tag_prefix()
+            wr_ids = hook.find_unfinished_run_work_requirements(None, prefix)
+        except Exception:
+            self.log.exception(
+                "Could not look up this DAG run's unfinished work requirements; "
+                "none cancelled"
+            )
+            return
+        if not wr_ids:
+            self.log.info("No unfinished work requirements of this DAG run")
+            return
+        self.log.warning(
+            "Cancelling %d unfinished work requirement(s) of this DAG run, "
+            "aborting running tasks",
+            len(wr_ids),
+        )
+        for wr_id in wr_ids:
+            try:
+                hook.cancel_work_requirement(wr_id, abort=True)
+            except Exception:
+                self.log.exception("Failed to cancel work requirement ID '%s'", wr_id)
+
+    def _wait_sync(
+        self,
+        get_state: Callable[[], Enum],
+        targets: Sequence[Enum],
+        timeout: float,
+        kind: str,
+        resource_id: str,
+    ) -> None:
+        """Poll until a target state (no failure states) or the timeout."""
+        wait_for_state(
+            get_state,
+            targets,
+            (),
+            poke_interval=self.poke_interval,
+            timeout=timeout,
+            describe=lambda state: YellowDogStateError(  # Unused: no failures
+                kind=kind,
+                resource_id=resource_id,
+                current_state=state,
+                target_states=targets,
+            ),
+            log=self.log,
+            kind=kind,
+            resource_id=resource_id,
+        )
+
+    def _await_deferred(
+        self,
+        hook: YellowDogHook,
+        pool_id: str,
+        cr_id: str | None,
+        end_time: float,
+        *,
+        pool_done: bool = False,
+    ) -> str:
+        """
+        Check the worker pool (unless ``pool_done``) and then the compute
+        requirement (if any) once each, deferring on the first that has not
+        yet finished; return the worker pool ID if both have.
+        """
+        if not pool_done:
+            pool_state = hook.get_worker_pool_state(pool_id)
+            if pool_state not in WORKER_POOL_FINAL_STATES:
+                self._defer_wait(
+                    ResourceKind.WORKER_POOL,
+                    pool_id,
+                    [cast(str, s.value) for s in WORKER_POOL_FINAL_STATES],
+                    end_time,
+                    {"worker_pool_id": pool_id, "compute_requirement_id": cr_id},
+                )
+            self.log.info("Worker pool reached status '%s'", pool_state.value)
+        if cr_id is not None:
+            cr_state = hook.get_compute_requirement_state(cr_id)
+            if cr_state not in COMPUTE_REQUIREMENT_FINAL_STATES:
+                self._defer_wait(
+                    ResourceKind.COMPUTE_REQUIREMENT,
+                    cr_id,
+                    [cast(str, s.value) for s in COMPUTE_REQUIREMENT_FINAL_STATES],
+                    end_time,
+                    {"worker_pool_id": pool_id, "compute_requirement_id": None},
+                )
+            self.log.info("Compute requirement reached status '%s'", cr_state.value)
+        return pool_id
+
+    def _defer_wait(
+        self,
+        kind: ResourceKind,
+        resource_id: str,
+        targets: list[str],
+        end_time: float,
+        kwargs: dict[str, Any],
+    ) -> NoReturn:
+        trigger = YellowDogStateTrigger(
+            connection_id=resolve(self.connection_id, "connection_id"),
+            kind=kind,
+            resource_id=resource_id,
+            target_states=targets,
+            failure_states=[],
+            poke_interval=self.poke_interval,
+            end_time=end_time,
+        )
+        self.defer(
+            trigger=trigger,
+            method_name="execute_complete",
+            kwargs={**kwargs, "end_time": end_time},
+            timeout=timedelta(
+                seconds=max(0.0, end_time - time.time()) + DEFER_TIMEOUT_GRACE
+            ),
+        )
