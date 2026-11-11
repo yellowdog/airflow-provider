@@ -85,7 +85,8 @@ class YellowDogHook(BaseHook):
         connection ID. The client is created once and cached.
 
         :returns: a YellowDog PlatformClient object
-        :raises YellowDogException: if the connection lacks credentials
+        :raises ~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException:
+            if the connection lacks credentials
         """
         if self.client is None:
             connection = self.get_connection(self.connection_id)

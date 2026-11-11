@@ -120,7 +120,7 @@ What it does:
   pulls that ID from XCom and checks the work requirement's status every 30
   seconds, for up to 30 minutes, until it is ``COMPLETED``. If the work
   requirement reaches ``FAILED`` or ``CANCELLED`` instead, the sensor fails
-  at once with ``YellowDogStateError`` (see :ref:`failure states <failure-states>`).
+  at once with :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError` (see :ref:`failure states <failure-states>`).
 
 5. Trigger a run
 ----------------
@@ -149,7 +149,7 @@ What to expect
 - When the work requirement completes, ``wait`` logs ``... has reached
   status 'COMPLETED'`` and succeeds, and so does the DAG run.
 - If the work fails or is cancelled, ``wait`` fails with
-  ``YellowDogStateError`` (for example ``Work requirement
+  :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError` (for example ``Work requirement
   'airflow-quickstart/quickstart-...' (ID '...') reached status 'FAILED',
   which is a failure state (target states: 'COMPLETED')``), and the DAG run
   fails. Look at the task's details in the YellowDog Portal to see why. To

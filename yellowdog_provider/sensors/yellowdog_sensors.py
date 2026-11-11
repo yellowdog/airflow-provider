@@ -110,7 +110,7 @@ class YellowDogSensor(BaseSensorOperator):
         """
         Pushes the object ID to XCom (first poke only), then checks the current
         state against the target state(s) and returns true if the condition is
-        met. Raises YellowDogStateError if the current state is one of the
+        met. Raises :exc:`.YellowDogStateError` if the current state is one of the
         failure states.
         """
 
@@ -189,9 +189,9 @@ class WorkRequirementStateSensor(YellowDogSensor):
     """
     Sensor that tests if a work requirement has reached one of a specified
     set of states. Either the work_requirement_id or both namespace and
-    work_requirement_name must be supplied, otherwise a YellowDogArgumentError
-    is raised. A field that renders to ``"None"`` raises a YellowDogArgumentError.
-    All arguments are keyword-only.
+    work_requirement_name must be supplied, otherwise a
+    :exc:`.YellowDogArgumentError` is raised. A field that renders to ``"None"``
+    raises a :exc:`.YellowDogArgumentError`. All arguments are keyword-only.
 
     Emits the work requirement ID to XCom using key 'return_value'.
 
@@ -205,7 +205,7 @@ class WorkRequirementStateSensor(YellowDogSensor):
         to test for
     :type target_states: list[WorkRequirementStatus]
     :param failure_states: the WorkRequirementStatus states that make the sensor
-        fail at once with YellowDogStateError. Defaults to the final states
+        fail at once with :exc:`.YellowDogStateError`. Defaults to the final states
         (COMPLETED, FAILED and CANCELLED) that are not in target_states; an empty
         list disables failure detection
     :type failure_states: Sequence[WorkRequirementStatus] | None
@@ -288,9 +288,9 @@ class WorkerPoolStateSensor(YellowDogSensor):
     """
     Sensor that tests if a worker pool has reached one of a specified
     set of states. Either the worker_pool_id or both the namespace and
-    worker_pool_name must be supplied, otherwise a YellowDogArgumentError
-    is raised. A field that renders to ``"None"`` raises a YellowDogArgumentError.
-    All arguments are keyword-only.
+    worker_pool_name must be supplied, otherwise a
+    :exc:`.YellowDogArgumentError` is raised. A field that renders to ``"None"``
+    raises a :exc:`.YellowDogArgumentError`. All arguments are keyword-only.
 
     Emits the worker pool ID to XCom using key 'return_value'.
 
@@ -304,7 +304,7 @@ class WorkerPoolStateSensor(YellowDogSensor):
         test for
     :type target_states: list[WorkerPoolStatus]
     :param failure_states: the WorkerPoolStatus states that make the sensor
-        fail at once with YellowDogStateError. Defaults to the final states
+        fail at once with :exc:`.YellowDogStateError`. Defaults to the final states
         (SHUTDOWN and TERMINATED) that are not in target_states; an empty
         list disables failure detection
     :type failure_states: Sequence[WorkerPoolStatus] | None
@@ -382,9 +382,9 @@ class ComputeRequirementStateSensor(YellowDogSensor):
     """
     Sensor that tests if a compute requirement has reached one of a specified
     set of states. Either the compute_requirement_id or both the namespace and
-    compute_requirement_name must be supplied, otherwise a YellowDogArgumentError
-    is raised. A field that renders to ``"None"`` raises a YellowDogArgumentError.
-    All arguments are keyword-only.
+    compute_requirement_name must be supplied, otherwise a
+    :exc:`.YellowDogArgumentError` is raised. A field that renders to ``"None"``
+    raises a :exc:`.YellowDogArgumentError`. All arguments are keyword-only.
 
     Emits the compute requirement ID to XCom using key 'return_value'.
 
@@ -398,7 +398,7 @@ class ComputeRequirementStateSensor(YellowDogSensor):
         states to test for
     :type target_states: list[ComputeRequirementStatus]
     :param failure_states: the ComputeRequirementStatus states that make the sensor
-        fail at once with YellowDogStateError. Defaults to the final states
+        fail at once with :exc:`.YellowDogStateError`. Defaults to the final states
         (TERMINATED) that are not in target_states; an empty
         list disables failure detection
     :type failure_states: Sequence[ComputeRequirementStatus] | None

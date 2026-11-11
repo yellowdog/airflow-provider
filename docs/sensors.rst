@@ -83,7 +83,7 @@ renders to ``"None"`` raises
 
 **target_states** must be a non-empty list of the SDK status enum for the
 resource; an empty list, or a value of another type (such as the string
-``"COMPLETED"``), raises ``YellowDogArgumentError`` when the sensor is
+``"COMPLETED"``), raises :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError` when the sensor is
 constructed.
 
 .. _failure-states:
@@ -128,10 +128,10 @@ target states; the same values are attributes of the exception
 - ``[]`` disables failure detection: the sensor waits only for
   ``target_states`` until ``timeout``, as in 1.x.
 
-A state may not be in both lists: an overlap raises ``YellowDogArgumentError``
+A state may not be in both lists: an overlap raises :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError`
 (naming the overlapping states) when the sensor is constructed.
 
-**Failure states and retries.** ``YellowDogStateError`` is also Airflow's
+**Failure states and retries.** :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError` is also Airflow's
 ``AirflowFailException``, so Airflow fails the sensor task at once and does
 not retry it, whatever its ``retries`` (a resource in a final state will not
 change).

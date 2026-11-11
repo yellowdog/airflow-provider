@@ -86,7 +86,7 @@ name:
   ignoring the name``).
 - The check is repeated after templates are rendered. A templated argument
   that renders to an empty (or whitespace-only) string counts as not supplied.
-  One that renders to the string ``"None"`` raises ``YellowDogArgumentError``,
+  One that renders to the string ``"None"`` raises :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError`,
   because that almost always means an ``xcom_pull`` found no value (see
   :ref:`none-ids`).
 - Looking up a name that does not exist fails with the SDK's ``404`` error.
@@ -311,7 +311,7 @@ group's tasks.
 **Returns:** the ID of the new work requirement (``str``).
 
 **Fails if:** the work requirement has preset ``taskGroups``
-(``YellowDogArgumentError``, raised when the task runs, before anything is
+(:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError`, raised when the task runs, before anything is
 sent to YellowDog), or YellowDog rejects any step. Because the work
 requirement is created first, a failure in a later step leaves a partly
 populated work requirement on the platform, and a retry with the same name

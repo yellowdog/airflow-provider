@@ -34,7 +34,7 @@ supported (1.0.4 required Airflow 2.10 or later).
 **AddPopulatedWorkRequirement rejects work requirements that already have task
 groups.** Supply the task groups through ``task_groups_and_tasks`` instead; a
 work requirement with a preset ``taskGroups`` raises
-``YellowDogArgumentError``.
+:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError`.
 
 .. code-block:: python
 
@@ -57,11 +57,11 @@ work requirement with a preset ``taskGroups`` raises
 
 **ShutdownProvisionedWorkerPool raises instead of returning None.** For a
 worker pool of an unsupported type (not a provisioned pool) the operator now
-raises ``YellowDogException``; 1.0.4 returned ``None`` and the task
+raises :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException`; 1.0.4 returned ``None`` and the task
 succeeded. Configured worker pools already raised. The return value is now
 always the worker pool ID (``str``).
 
-**Templated IDs that render to "None" raise YellowDogArgumentError.** When an
+**Templated IDs that render to "None" raise :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError`.** When an
 upstream XCom value is missing, a templated field such as
 ``"{{ ti.xcom_pull(task_ids='x') }}"`` renders to the string ``"None"``. 1.0.4
 used it as a real ID and failed later with an obscure platform error;
@@ -70,8 +70,8 @@ not supplied.
 
 **A missing ID or name fails when the DAG is parsed.** Operators and sensors
 that identify a resource by ID or by namespace plus name now raise
-``YellowDogArgumentError`` in the constructor if neither is supplied
-(1.0.4 raised ``YellowDogException`` at run time). Sensors also reject an
+:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError` in the constructor if neither is supplied
+(1.0.4 raised :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException` at run time). Sensors also reject an
 empty ``target_states``.
 
 .. code-block:: python
@@ -85,7 +85,7 @@ empty ``target_states``.
        work_requirement_id="{{ ti.xcom_pull(task_ids='add_wr') }}",
    )
 
-``YellowDogArgumentError`` subclasses both ``YellowDogException`` and
+:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError` subclasses both :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException` and
 ``ValueError``, so existing ``except YellowDogException`` handlers still work.
 
 **Sensor subclassing: ``target_states_names`` removed.** The public
@@ -107,8 +107,8 @@ only custom sensors that subclass ``YellowDogSensor`` or read the attribute.
 **Sensors fail when the resource reaches a failure state.** Each state
 sensor has a new ``failure_states`` argument. By default it is every *final*
 state that is not in ``target_states``, and a sensor whose resource reaches one
-of these states now fails at once with ``YellowDogStateError`` instead of
-waiting (1.0.4 kept poking until ``timeout``). ``YellowDogStateError`` is an
+of these states now fails at once with :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError` instead of
+waiting (1.0.4 kept poking until ``timeout``). :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError` is an
 ``AirflowFailException``, so the task is not retried and ``silent_fail`` does
 not suppress it. The final states are:
 ``COMPLETED``, ``FAILED`` and ``CANCELLED`` (work requirements); ``SHUTDOWN``
@@ -117,7 +117,7 @@ Listing a failure outcome such as ``FAILED`` in ``target_states`` just to stop
 waiting made the DAG run succeed when the YellowDog work failed; wait for
 ``COMPLETED`` only, and the sensor fails if the work fails or is cancelled.
 ``target_states`` and ``failure_states`` must not overlap, and both must hold
-the sensor's status enum (``YellowDogArgumentError`` otherwise).
+the sensor's status enum (:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError` otherwise).
 
 .. code-block:: python
 
@@ -153,10 +153,10 @@ Added
   that closes the client afterwards.
 * ``TemplateCallable`` and ``Templated``, typed helpers for templated fields
   that may be supplied as callables (``yellowdog_provider.utils.templating``).
-* ``YellowDogArgumentError`` (``yellowdog_provider.exceptions``).
+* :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError` (``yellowdog_provider.exceptions``).
 * ``failure_states`` on ``WorkRequirementStateSensor``,
   ``WorkerPoolStateSensor`` and ``ComputeRequirementStateSensor``, and
-  ``YellowDogStateError`` (``yellowdog_provider.exceptions``, also an
+  :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError` (``yellowdog_provider.exceptions``, also an
   ``AirflowFailException``), raised when a sensor's resource reaches a failure
   state; see :doc:`sensors`.
 * Full Airflow provider metadata (``get_provider_info``: integrations, hooks,

@@ -30,7 +30,7 @@ def require_id_or_name(
     name_fields: dict[str, object | None],
 ) -> None:
     """
-    Raise YellowDogArgumentError unless the ID is supplied, or every one of the
+    Raise :exc:`.YellowDogArgumentError` unless the ID is supplied, or every one of the
     name fields is supplied. Values may be unrendered templates or callables.
     """
     if object_id is not None:

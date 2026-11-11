@@ -9,7 +9,7 @@ How errors surface
 
 The provider does not hide errors: anything that goes wrong fails the Airflow
 task, with the exception in the task log, and Airflow retries the task
-according to its ``retries`` setting (except for ``YellowDogStateError``,
+according to its ``retries`` setting (except for :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError`,
 below). The exceptions come from the provider itself and from the YellowDog
 SDK.
 
@@ -19,7 +19,7 @@ SDK.
    that is not a provisioned pool, or a callable that was never rendered.
 
 :class:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError`
-   A subclass of both ``YellowDogException`` and Python's ``ValueError``,
+   A subclass of both :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException` and Python's ``ValueError``,
    raised when an operator or sensor argument is missing, malformed or
    inconsistent: neither an ID nor a complete name given, an empty
    ``target_states`` list, ``target_states`` or ``failure_states`` holding
@@ -30,7 +30,7 @@ SDK.
    appears as a DAG import error in the Airflow UI instead of a task failure.
 
 :class:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError`
-   A subclass of ``YellowDogException``, raised by a sensor whose resource has
+   A subclass of :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException`, raised by a sensor whose resource has
    reached one of its ``failure_states`` (by default, a final state that is
    not a target, such as ``FAILED`` or ``CANCELLED`` when waiting for
    ``COMPLETED``). The message names the resource, its current state and the
@@ -52,7 +52,7 @@ Errors from the YellowDog SDK
    as success.
 
 To handle provider errors yourself, for example in a subclass or in your own
-task using the hook, catch ``YellowDogException``, and SDK errors
+task using the hook, catch :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException`, and SDK errors
 separately.
 
 Common problems
@@ -116,7 +116,7 @@ Common problems
      - Check the resource in the YellowDog Portal. Check the run
        specification's ``taskTypes`` and ``workerTags`` against the pool.
        Increase ``timeout`` if the work is just slow.
-   * - Sensor fails with ``YellowDogStateError``
+   * - Sensor fails with :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogStateError`
      - The resource reached a failure state, for example a work requirement
        ``FAILED`` or ``CANCELLED`` while the sensor waited for ``COMPLETED``,
        or a worker pool shut down before becoming ``IDLE``.

@@ -116,9 +116,9 @@ class AddTaskGroupsToWorkRequirement(YellowDogOperator):
     """
     Add task groups to a YellowDog work requirement. Either the work_requirement_id
     or both the namespace and work_requirement_name must be supplied, otherwise
-    a YellowDogArgumentError is raised. A field that renders to an empty string
+    a :exc:`.YellowDogArgumentError` is raised. A field that renders to an empty string
     is treated as not supplied; one that renders to ``"None"`` raises a
-    YellowDogArgumentError (usually a missing upstream XCom value). All
+    :exc:`.YellowDogArgumentError` (usually a missing upstream XCom value). All
     arguments are keyword-only.
 
     :param task_id: the Airflow task ID
@@ -221,10 +221,10 @@ class AddTasksToTaskGroup(YellowDogOperator):
     """
     Add a list of tasks to a task group. Either the task_group_id,
     or all of: namespace, work_requirement_name and task_group_name,
-    must be supplied, otherwise a YellowDogArgumentError is raised. If both
+    must be supplied, otherwise a :exc:`.YellowDogArgumentError` is raised. If both
     are supplied, the task_group_id is used. A field
     that renders to an empty string is treated as not supplied; one that
-    renders to ``"None"`` raises a YellowDogArgumentError (usually a missing
+    renders to ``"None"`` raises a :exc:`.YellowDogArgumentError` (usually a missing
     upstream XCom value). All arguments are keyword-only.
 
     :param task_id: the Airflow task ID
@@ -347,7 +347,7 @@ class AddPopulatedWorkRequirement(YellowDogOperator):
     """
     Add a 'one-shot', populated YellowDog work requirement to the platform,
     including its task groups and tasks. The supplied work requirement must not
-    already contain task groups (a YellowDogArgumentError is raised if it does);
+    already contain task groups (a :exc:`.YellowDogArgumentError` is raised if it does);
     supply them via task_groups_and_tasks instead. All arguments are
     keyword-only.
 
@@ -438,9 +438,9 @@ class CancelWorkRequirement(YellowDogOperator):
     """
     Cancel a YellowDog work requirement. Either the work_requirement_id or both
     namespace and work_requirement_name must be supplied, otherwise a
-    YellowDogArgumentError is raised. A field that renders to an empty string
+    :exc:`.YellowDogArgumentError` is raised. A field that renders to an empty string
     is treated as not supplied; one that renders to ``"None"`` raises a
-    YellowDogArgumentError (usually a missing upstream XCom value). All
+    :exc:`.YellowDogArgumentError` (usually a missing upstream XCom value). All
     arguments are keyword-only.
 
     If the platform rejects the cancellation as an invalid state transition
@@ -612,11 +612,13 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
     Shuts down a YellowDog provisioned worker pool, and optionally
     immediately terminates its associated compute requirement. Either the
     worker_pool_id or both the namespace and worker_pool_name must be
-    supplied, otherwise a YellowDogArgumentError is raised. A field that
+    supplied, otherwise a :exc:`.YellowDogArgumentError` is raised. A field that
     renders to an empty string is treated as not supplied; one that renders
-    to ``"None"`` raises a YellowDogArgumentError (usually a missing upstream
+    to ``"None"`` raises a :exc:`.YellowDogArgumentError` (usually a missing upstream
     XCom value). A configured (or otherwise non-provisioned) worker pool
-    raises a YellowDogException. All arguments are keyword-only.
+    raises a
+    :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException`.
+    All arguments are keyword-only.
 
     :param task_id: the Airflow task ID
     :type task_id: str
