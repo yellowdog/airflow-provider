@@ -145,6 +145,8 @@ cython_debug/
 
 # Project
 tests/system/config.toml
+tests/system/userdata.sh
+.venv-systest-*/
 .ruff_cache/
 
 # Superpowers working files

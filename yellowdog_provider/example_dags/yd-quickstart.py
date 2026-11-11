@@ -36,14 +36,14 @@ def make_groups_and_tasks(
     return [(TaskGroup(name="group-1", runSpecification=spec), [task])]
 
 
-_FINAL = [WorkRequirementStatus.COMPLETED, WorkRequirementStatus.FAILED]
 dag: DAG = DAG(
     dag_id="yellowdog-quickstart",
     # worker_tag must match the tag of an existing, running worker pool
     params=ParamsDict({"namespace": "airflow-quickstart", "worker_tag": "my-tag"}),
 )
 with dag:
-    # Submit a work requirement, then poll until it reaches a final state.
+    # Submit a work requirement, then poll until it completes. If it fails or is
+    # cancelled instead, the sensor (and so the DAG run) fails at once.
     chain(
         AddPopulatedWorkRequirement(
             task_id="submit",
@@ -53,7 +53,7 @@ with dag:
         WorkRequirementStateSensor(
             task_id="wait",
             work_requirement_id="{{ ti.xcom_pull(task_ids='submit') }}",
-            target_states=_FINAL,
+            target_states=[WorkRequirementStatus.COMPLETED],
             poke_interval=30,
             timeout=30 * 60,
         ),

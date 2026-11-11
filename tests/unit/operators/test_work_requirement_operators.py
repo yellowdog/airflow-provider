@@ -5,6 +5,7 @@ import pytest
 from airflow.sdk import Connection
 from requests.exceptions import HTTPError
 from yellowdog_client.model import RunSpecification, Task, TaskGroup, WorkRequirement
+from yellowdog_client.model.exceptions import InvalidRequestException
 
 from tests.support import make_context, render
 from yellowdog_provider.exceptions.yellowdog_exceptions import YellowDogArgumentError
@@ -169,8 +170,7 @@ def test_add_populated_adds_groups_then_tasks(mock_client: MagicMock) -> None:
     update = mock_client.work_client.update_work_requirement
     update.assert_called_once()
     sent = update.call_args.args[0].taskGroups
-    expected = [g2, g1] if ops._TASK_GROUP_SUBMISSION_REVERSED else [g1, g2]
-    assert sent == expected
+    assert sent == [g1, g2]  # submitted in the order supplied
 
     calls = mock_client.work_client.add_tasks_to_task_group_by_name.call_args_list
     assert [c.args for c in calls] == [
@@ -198,6 +198,29 @@ def test_cancel_reraises_other_http_errors(mock_client: MagicMock) -> None:
     )
     op = CancelWorkRequirement(task_id="t", work_requirement_id="wr-1")
     with pytest.raises(HTTPError):
+        _run(op)
+
+
+def test_cancel_tolerates_invalid_transition_custom_exception(
+    mock_client: MagicMock,
+) -> None:
+    mock_client.work_client.get_work_requirement_by_id.return_value = _wr(
+        id="wr-1", status=ops.WorkRequirementStatus.COMPLETED
+    )
+    mock_client.work_client.cancel_work_requirement_by_id.side_effect = (
+        InvalidRequestException("Invalid Transition from COMPLETED")
+    )
+    op = CancelWorkRequirement(task_id="t", work_requirement_id="wr-1")
+    assert _run(op) == "wr-1"
+
+
+def test_cancel_reraises_other_custom_exceptions(mock_client: MagicMock) -> None:
+    mock_client.work_client.get_work_requirement_by_id.return_value = _wr(id="wr-1")
+    mock_client.work_client.cancel_work_requirement_by_id.side_effect = (
+        InvalidRequestException("boom")
+    )
+    op = CancelWorkRequirement(task_id="t", work_requirement_id="wr-1")
+    with pytest.raises(InvalidRequestException):
         _run(op)
 
 

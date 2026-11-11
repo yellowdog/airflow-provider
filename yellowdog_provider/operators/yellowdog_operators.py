@@ -19,6 +19,7 @@ from yellowdog_client.model import (
     WorkRequirement,
     WorkRequirementStatus,
 )
+from yellowdog_client.model.exceptions import BaseCustomException
 
 from yellowdog_provider.exceptions.yellowdog_exceptions import (
     YellowDogArgumentError,
@@ -35,11 +36,6 @@ from yellowdog_provider.utils.yellowdog_utils import (
     get_worker_pool_by_id_or_name,
     require_id_or_name,
 )
-
-# Preserves the 1.x behaviour of submitting task groups to the platform in
-# reverse order (to maintain task group sequencing). To be verified against the
-# live platform by a system test (Task 13) and then settled.
-_TASK_GROUP_SUBMISSION_REVERSED = True
 
 
 class YellowDogOperator(BaseOperator):
@@ -82,7 +78,7 @@ class AddWorkRequirement(YellowDogOperator):
     :type connection_id: str | Callable
     :param work_requirement: a YellowDog WorkRequirement object or a
         Callable that generates a WorkRequirement object (templated)
-    :type work_requirement: WorkRequirement or Callable
+    :type work_requirement: WorkRequirement | Callable
 
     :return: the YellowDog ID of the added work requirement
     :rtype: str
@@ -225,7 +221,8 @@ class AddTasksToTaskGroup(YellowDogOperator):
     """
     Add a list of tasks to a task group. Either the task_group_id,
     or all of: namespace, work_requirement_name and task_group_name,
-    must be supplied, otherwise a YellowDogArgumentError is raised. A field
+    must be supplied, otherwise a YellowDogArgumentError is raised. If both
+    are supplied, the task_group_id is used. A field
     that renders to an empty string is treated as not supplied; one that
     renders to ``"None"`` raises a YellowDogArgumentError (usually a missing
     upstream XCom value). All arguments are keyword-only.
@@ -363,9 +360,8 @@ class AddPopulatedWorkRequirement(YellowDogOperator):
     :param work_requirement: a YellowDog WorkRequirement object or a
         Callable that generates a WorkRequirement object (templated)
     :type work_requirement: WorkRequirement | Callable
-    :param task_groups_and_tasks: a list of YellowDog TaskGroup objects with
-        their constituent Task objects, or a Callable that generates the list
-        (templated)
+    :param task_groups_and_tasks: a list of (TaskGroup, list of Task) pairs,
+        one per task group, or a Callable that generates the list (templated)
     :type task_groups_and_tasks: list[tuple[TaskGroup, list[Task]]] | Callable
 
     :return: the YellowDog ID of the added work requirement
@@ -418,8 +414,9 @@ class AddPopulatedWorkRequirement(YellowDogOperator):
                 f"Adding {len(task_groups)} task group(s) to work requirement: "
                 f"{[task_group.name for task_group in task_groups]}"
             )
-            if _TASK_GROUP_SUBMISSION_REVERSED:
-                task_groups.reverse()  # Maintain task group sequencing
+            # The platform preserves submission order, so no reversal is
+            # needed; verified by
+            # tests/system/test_components.py::test_add_populated_task_group_order
             added.taskGroups = task_groups
             added = client.work_client.update_work_requirement(added)
 
@@ -446,6 +443,10 @@ class CancelWorkRequirement(YellowDogOperator):
     YellowDogArgumentError (usually a missing upstream XCom value). All
     arguments are keyword-only.
 
+    If the platform rejects the cancellation as an invalid state transition
+    (e.g., the work requirement has already finished), a warning is logged
+    and the operator succeeds.
+
     :param task_id: the Airflow task ID
     :type task_id: str
     :param connection_id: connection to run the operator with (templated) or a
@@ -461,7 +462,8 @@ class CancelWorkRequirement(YellowDogOperator):
     :param work_requirement_name: the name of a work requirement (templated) or a
         Callable that generates a work requirement name
     :type work_requirement_name: str | Callable | None
-    :param abort_running_tasks: abort currently running tasks; defaults to 'False'
+    :param abort_running_tasks: abort currently running tasks rather than
+        letting them finish; defaults to ``False``
     :type abort_running_tasks: bool
 
     :return: the YellowDog ID of the cancelled work requirement
@@ -518,7 +520,9 @@ class CancelWorkRequirement(YellowDogOperator):
                 work_requirement = client.work_client.cancel_work_requirement_by_id(
                     cast(str, work_requirement.id), self.abort_running_tasks
                 )
-            except HTTPError as e:  # Tolerate idempotent cancellations (YEL-13327)
+            except (HTTPError, BaseCustomException) as e:
+                # Tolerate idempotent cancellations (YEL-13327); the SDK raises
+                # either HTTPError or a BaseCustomException subclass
                 if "invalid transition" in str(e).lower():
                     status = cast(WorkRequirementStatus, work_requirement.status)
                     self.log.warning(
@@ -630,7 +634,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
         Callable that generates a worker pool name
     :type worker_pool_name: str | Callable | None
     :param terminate_immediately: immediately terminate the associated
-        compute requirement (default: False)
+        compute requirement, failing any running tasks; defaults to ``False``
     :type terminate_immediately: bool
 
     :return: the YellowDog ID of the worker pool that was shut down

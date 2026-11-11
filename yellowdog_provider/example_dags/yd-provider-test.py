@@ -18,12 +18,18 @@ CONNECTION_ID = "prod-yellowdog-yd-demo"  # Param: connection_id
 CRT_NAME_OR_ID = "yd-demo/yd-demo-aws-gcp-azure-oci-split-ondemand"
 IMAGE_FAMILY_NAME_OR_ID = "yellowdog/yd-agent-docker"
 
+# Optional userdata script for the worker pool's instances (empty means none).
+# Note: userdata passed through this DAG param travels in the DAG-run conf (visible
+# on an `airflow dags trigger --conf` command line and stored in Airflow's DB),
+# so don't put secrets in it.
+USER_DATA = ""  # Param: user_data
+
 # Namespace for work requirements and worker pool
 NAMESPACE = "airflow-testing"  # Param: namespace
 
 # Worker pool scaling properties
 TARGET_INSTANCES = 1
-MAX_NODES = 1
+MAX_NODES = 1  # Param: max_nodes
 NODE_SHUTDOWN_TIMER_MINUTES = 2
 POOL_SHUTDOWN_TIMER_MINUTES = 2
 
@@ -37,11 +43,15 @@ SECOND_WR_PREFIX = "b-"
 SECOND_WR_NUM_ADDED_TASK_GROUPS = 2
 SECOND_WR_NUM_ADDED_TASKS = 2
 
-# Polling interval and timeout for sensors. A sensor's `timeout` is fixed when
-# the DAG is parsed and cannot be templated, so the sensors start with this
-# value and `_apply_sensor_timeout` replaces it with the run's
-# `sensor_timeout_seconds` param just before each sensor executes.
-POKE_INTERVAL_SECONDS = 10.0
+# Polling interval and timeout for sensors. A sensor's `poke_interval` and
+# `timeout` are fixed when the DAG is parsed and cannot be templated, so the
+# sensors start with these values and `_apply_sensor_params` replaces them with
+# the run's `poke_interval_seconds` and `sensor_timeout_seconds` params just
+# before each sensor executes. The hook updates `context["ti"].task`, the task
+# object actually executing: Airflow 3.1 runs a copy of the task
+# (`prepare_for_execution()`) while `context["task"]` still refers to the
+# original, so changing `context["task"]` would have no effect there.
+POKE_INTERVAL_SECONDS = 10.0  # Param: poke_interval_seconds
 SENSOR_TIMEOUT_SECONDS = 300.0  # Param: sensor_timeout_seconds
 
 # The name of the DAG in Airflow
@@ -49,6 +59,7 @@ DAG_ID = "yellowdog-provider-test"
 
 ###############################################################################
 
+import math
 from datetime import timedelta
 from re import sub
 from typing import Any, cast
@@ -80,6 +91,7 @@ from yellowdog_client.model import (
     WorkRequirementStatus,
 )
 
+from yellowdog_provider.exceptions.yellowdog_exceptions import YellowDogArgumentError
 from yellowdog_provider.hooks.yellowdog_hooks import YellowDogHook
 from yellowdog_provider.operators.yellowdog_operators import (
     AddPopulatedWorkRequirement,
@@ -110,6 +122,9 @@ from yellowdog_provider.sensors.yellowdog_sensors import (
         "task_type": TASK_TYPE,
         "task_arguments": TASK_ARGS,
         "sensor_timeout_seconds": SENSOR_TIMEOUT_SECONDS,
+        "poke_interval_seconds": POKE_INTERVAL_SECONDS,
+        "max_nodes": MAX_NODES,
+        "user_data": USER_DATA,
     },
 )
 def yd_provider_test():
@@ -165,14 +180,11 @@ def yd_provider_test():
         task_id="wait-for-work-requirement-1-to-finish",
         connection_id="{{ params.connection_id }}",
         work_requirement_id="{{ ti.xcom_pull(task_ids='add-work-requirement') }}",
-        target_states=[
-            WorkRequirementStatus.COMPLETED,
-            WorkRequirementStatus.FAILED,
-            WorkRequirementStatus.CANCELLED,
-        ],
+        # Fails at once if the work requirement fails or is cancelled
+        target_states=[WorkRequirementStatus.COMPLETED],
         poke_interval=POKE_INTERVAL_SECONDS,
         timeout=SENSOR_TIMEOUT_SECONDS,
-        pre_execute=_apply_sensor_timeout,
+        pre_execute=_apply_sensor_params,
     )
 
     wait_for_work_requirement_2_to_finish = WorkRequirementStateSensor(
@@ -180,14 +192,11 @@ def yd_provider_test():
         connection_id="{{ params.connection_id }}",
         namespace=gen_namespace,
         work_requirement_name=gen_wr_name_2,
-        target_states=[
-            WorkRequirementStatus.COMPLETED,
-            WorkRequirementStatus.FAILED,
-            WorkRequirementStatus.CANCELLED,
-        ],
+        # Fails at once if the work requirement fails or is cancelled
+        target_states=[WorkRequirementStatus.COMPLETED],
         poke_interval=POKE_INTERVAL_SECONDS,
         timeout=SENSOR_TIMEOUT_SECONDS,
-        pre_execute=_apply_sensor_timeout,
+        pre_execute=_apply_sensor_params,
     )
 
     shut_down_worker_pool = ShutdownProvisionedWorkerPool(
@@ -213,7 +222,7 @@ def yd_provider_test():
         target_states=[WorkerPoolStatus.SHUTDOWN, WorkerPoolStatus.TERMINATED],
         poke_interval=POKE_INTERVAL_SECONDS,
         timeout=SENSOR_TIMEOUT_SECONDS,
-        pre_execute=_apply_sensor_timeout,
+        pre_execute=_apply_sensor_params,
         trigger_rule=TriggerRule.ALL_DONE,
     )
 
@@ -227,7 +236,7 @@ def yd_provider_test():
         ],
         poke_interval=POKE_INTERVAL_SECONDS,
         timeout=SENSOR_TIMEOUT_SECONDS,
-        pre_execute=_apply_sensor_timeout,
+        pre_execute=_apply_sensor_params,
         trigger_rule=TriggerRule.ALL_DONE,
     )
 
@@ -318,12 +327,23 @@ def gen_crtu(
         templateId=_params(context)["compute_requirement_template"],
         imagesId=_get_images_id(_params(context)["image_family"], context),
         requirementNamespace=gen_namespace(context, Environment()),
+        userData=_get_user_data(context),
     )
+
+
+def _get_user_data(context: Context) -> str | None:
+    user_data: str = _params(context).get("user_data") or ""
+    return user_data if user_data.strip() else None
 
 
 def gen_pwpp(
     context: Context, jinja_env: Environment
 ) -> ProvisionedWorkerPoolProperties:
+    max_nodes = _positive_int_param(_params(context), "max_nodes")
+    if max_nodes < TARGET_INSTANCES:
+        raise YellowDogArgumentError(
+            f"Param 'max_nodes' must be >= {TARGET_INSTANCES} (got {max_nodes})"
+        )
     return ProvisionedWorkerPoolProperties(
         createNodeWorkers=NodeWorkerTarget(
             targetCount=1, targetType=NodeWorkerTargetType.PER_VCPU
@@ -335,7 +355,7 @@ def gen_pwpp(
             enabled=True, timeout=timedelta(minutes=POOL_SHUTDOWN_TIMER_MINUTES)
         ),
         minNodes=0,
-        maxNodes=MAX_NODES,
+        maxNodes=max_nodes,
         workerTag=_get_worker_tag(context),
     )
 
@@ -404,13 +424,55 @@ def _params(context: Context) -> dict[str, Any]:
     return cast("dict[str, Any]", context)["params"]
 
 
-def _apply_sensor_timeout(context: Context) -> None:
+def _positive_param(params: dict[str, Any], name: str) -> float:
     """
-    Sensor `pre_execute` hook: take the sensor's timeout from the run's params.
+    A numeric param that must be a finite number greater than zero.
     """
-    sensor = cast("dict[str, Any]", context)["task"]
+    raw = params[name]
+    value = _number_param(name, raw)
+    if not math.isfinite(value) or value <= 0:
+        raise YellowDogArgumentError(
+            f"Param '{name}' must be a finite number > 0 (got {raw!r})"
+        )
+    return value
+
+
+def _positive_int_param(params: dict[str, Any], name: str) -> int:
+    """
+    A numeric param that must be a whole number greater than zero.
+    """
+    raw = params[name]
+    value = _number_param(name, raw)
+    if not math.isfinite(value) or not value.is_integer() or value <= 0:
+        raise YellowDogArgumentError(
+            f"Param '{name}' must be a whole number > 0 (got {raw!r})"
+        )
+    return int(value)
+
+
+def _number_param(name: str, raw: Any) -> float:
+    # bool is an int subclass, but True/False is never a meaningful number here
+    if isinstance(raw, bool):
+        raise YellowDogArgumentError(f"Param '{name}' must be a number (got {raw!r})")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise YellowDogArgumentError(
+            f"Param '{name}' must be a number (got {raw!r})"
+        ) from None
+
+
+def _apply_sensor_params(context: Context) -> None:
+    """
+    Sensor `pre_execute` hook: take the sensor's timeout and poke interval from
+    the run's params.
+    """
+    # ti.task, not context["task"]: see the note above SENSOR_TIMEOUT_SECONDS
+    sensor = cast("dict[str, Any]", context)["ti"].task
     assert isinstance(sensor, BaseSensorOperator)
-    sensor.timeout = float(_params(context)["sensor_timeout_seconds"])
+    params = _params(context)
+    sensor.timeout = _positive_param(params, "sensor_timeout_seconds")
+    sensor.poke_interval = _positive_param(params, "poke_interval_seconds")
 
 
 def _get_wr_name(context: Context, prefix: str = "") -> str:
@@ -465,11 +527,12 @@ def _get_images_id(image_family_name: str, context: Context) -> str:
     image_family_search = MachineImageFamilySearch(
         namespace=namespace, familyName=name, includePublic=True
     )
-    client = YellowDogHook(_params(context)["connection_id"]).get_conn()
-    search_client: SearchClient[MachineImageFamilySummary] = (
-        client.images_client.get_image_families(image_family_search)
-    )
-    image_families: list[MachineImageFamilySummary] = search_client.list_all()
+    with YellowDogHook(_params(context)["connection_id"]) as hook:
+        client = hook.get_conn()
+        search_client: SearchClient[MachineImageFamilySummary] = (
+            client.images_client.get_image_families(image_family_search)
+        )
+        image_families: list[MachineImageFamilySummary] = search_client.list_all()
 
     # Partial names will match, so find an exact match
     for image_family in image_families:

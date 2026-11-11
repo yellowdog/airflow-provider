@@ -35,10 +35,8 @@ release = __version__
 
 extensions = ["sphinx.ext.todo", "sphinx.ext.viewcode", "sphinx.ext.autodoc"]
 
-autodoc_mock_imports = ["airflow"]
-
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "superpowers"]
 
 
 # -- Options for HTML output -------------------------------------------------

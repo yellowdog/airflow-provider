@@ -30,6 +30,16 @@ class YellowDogHook(BaseHook):
     """
     Hook class that supports Application Key/Secret connections to the
     YellowDog Platform API.
+
+    The connection's host is the Platform API URL: if empty, the default
+    (``https://api.yellowdog.ai``) is used; if it has no scheme, ``https://``
+    is added; trailing ``/`` characters are removed. The login and password
+    are the Application Key ID and Secret. Use the hook as a context manager
+    to close the client afterwards.
+
+    :param connection_id: the Airflow connection ID; defaults to
+        ``yellowdog_default``
+    :type connection_id: str
     """
 
     conn_type = CONNECTION_TYPE
@@ -121,6 +131,9 @@ class YellowDogHook(BaseHook):
         """
         Verify the connection with one lightweight authenticated read
         (the first namespace, if any).
+
+        :returns: a (success, message) tuple, as used by Airflow's connection
+            test
         """
         try:
             client = self.get_conn()

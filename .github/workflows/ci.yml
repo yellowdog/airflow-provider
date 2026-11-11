@@ -4,7 +4,7 @@ on:
   push:
     branches: [next-version]
   pull_request:
-    branches: [main]
+    branches: [main, next-version]
   workflow_dispatch:
 
 permissions:
@@ -28,28 +28,16 @@ jobs:
       - run: make lint
 
   typecheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.14"
-          activate-environment: true
-          enable-cache: true
-      - run: uv pip install -e '.[dev]'
-      - run: make typecheck
-
-  test:
-    name: test (py${{ matrix.python }}, airflow ${{ matrix.airflow }})
+    name: typecheck (py${{ matrix.python }}, airflow ${{ matrix.airflow }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        # Type-check at both ends of the supported range, installed as in the
+        # test job (min also pins the yellowdog-sdk floor).
         include:
-          - { python: "3.12", airflow: "3.1.0" }
-          - { python: "3.13", airflow: "3.1.0" }
-          - { python: "3.12", airflow: "latest" }
-          - { python: "3.14", airflow: "latest" }
+          - { python: "3.12", airflow: "min" }
+          - { python: "3.14", airflow: "max" }
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -59,19 +47,67 @@ jobs:
           enable-cache: true
       - name: Resolve Airflow version
         id: airflow
+        env:
+          LABEL: ${{ matrix.airflow }}
         run: |
-          if [ "${{ matrix.airflow }}" = "latest" ]; then
-            V=$(curl -fsSL https://pypi.org/pypi/apache-airflow/json | jq -r .info.version)
-          else
-            V="${{ matrix.airflow }}"
+          V=$(python bin/airflow_versions.py "${LABEL}")
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          if [ "${LABEL}" = "min" ]; then
+            SDK=$(python bin/airflow_versions.py sdk-min)
+            echo "sdk_pin=yellowdog-sdk==${SDK}" >> "$GITHUB_OUTPUT"
           fi
-          echo "version=$V" >> "$GITHUB_OUTPUT"
       - name: Install with Airflow constraints
         env:
           AIRFLOW_VERSION: ${{ steps.airflow.outputs.version }}
           PY: ${{ matrix.python }}
+          SDK_PIN: ${{ steps.airflow.outputs.sdk_pin }}
+        run: |
+          pkgs=("apache-airflow==${AIRFLOW_VERSION}" -e '.[dev]')
+          if [ -n "${SDK_PIN}" ]; then pkgs+=("${SDK_PIN}"); fi
+          uv pip install "${pkgs[@]}" \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PY}.txt"
+      - run: make typecheck
+
+  test:
+    name: test (py${{ matrix.python }}, airflow ${{ matrix.airflow }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # min/max are resolved by bin/airflow_versions.py: min is the
+        # apache-airflow floor in pyproject.toml, max the latest on PyPI.
+        include:
+          - { python: "3.12", airflow: "min" }
+          - { python: "3.13", airflow: "min" }
+          - { python: "3.12", airflow: "max" }
+          - { python: "3.14", airflow: "max" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          activate-environment: true
+          enable-cache: true
+      - name: Resolve Airflow version
+        id: airflow
+        env:
+          LABEL: ${{ matrix.airflow }}
+        run: |
+          V=$(python bin/airflow_versions.py "${LABEL}")
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          SDK_TEXT="latest allowed by the constraints"
           # Minimum-Airflow rows also test the declared yellowdog-sdk floor.
-          SDK_PIN: ${{ matrix.airflow != 'latest' && 'yellowdog-sdk==15.2.0' || '' }}
+          if [ "${LABEL}" = "min" ]; then
+            SDK=$(python bin/airflow_versions.py sdk-min)
+            echo "sdk_pin=yellowdog-sdk==${SDK}" >> "$GITHUB_OUTPUT"
+            SDK_TEXT="yellowdog-sdk==${SDK}"
+          fi
+          echo "Airflow ${LABEL}: apache-airflow==${V}; yellowdog-sdk: ${SDK_TEXT}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install with Airflow constraints
+        env:
+          AIRFLOW_VERSION: ${{ steps.airflow.outputs.version }}
+          PY: ${{ matrix.python }}
+          SDK_PIN: ${{ steps.airflow.outputs.sdk_pin }}
         run: |
           pkgs=("apache-airflow==${AIRFLOW_VERSION}" -e '.[dev]')
           if [ -n "${SDK_PIN}" ]; then pkgs+=("${SDK_PIN}"); fi

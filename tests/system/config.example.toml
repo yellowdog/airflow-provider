@@ -1,0 +1,37 @@
+# Copy to tests/system/config.toml (git-ignored) and fill in.
+# Override the location with the YD_SYSTEM_TEST_CONFIG environment variable.
+
+[platform]
+api_url = "https://api.yellowdog.ai"
+key_id = "<application key id>"
+key_secret = "<application key secret>"
+
+[resources]
+namespace = "<namespace>"
+compute_requirement_template = "<namespace>/<template name>"
+image_family = "<namespace>/<image family>"
+# Path relative to this config file; contents are passed as instance userdata.
+# Note: it travels in the DAG-run conf (visible on the `airflow dags trigger --conf`
+# command line, stored in Airflow's DB), so don't put secrets in it.
+# user_data_file = "userdata.sh"
+task_type = "docker"
+task_arguments = ["hello-world"]
+
+[limits]
+# Worker pool size for the component tests; also the example DAG's max_nodes
+# param in the e2e test. Sensor timings are passed to the DAG too.
+max_instances = 1
+poke_interval_seconds = 10
+sensor_timeout_seconds = 900
+
+[e2e]
+# Airflow versions to run the e2e test with, each in apache/airflow:slim-<version>-python3.12:
+# "min" (the apache-airflow floor in pyproject.toml),
+# "max" (the latest Airflow on PyPI) or an explicit "X.Y.Z". Default: ["min", "max"].
+# Live tests always use the latest yellowdog-sdk at every version (only CI's
+# min rows pin the yellowdog-sdk floor from pyproject.toml).
+# YD_SYSTEM_TEST_AIRFLOW (e.g. "min" or "min,3.2.1") overrides this.
+# airflow_versions = ["min", "max"]
+# Publish the Airflow UI on localhost at this port (the n-th Airflow version tested uses
+# ui_port + n) and keep the containers after the test.
+# ui_port = 8080
