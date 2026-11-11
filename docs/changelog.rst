@@ -4,9 +4,6 @@ Changelog
 2.0.0 (unreleased)
 ------------------
 
-Version 2.0.0 is relative to 1.0.4, the last release published to PyPI.
-Version 1.0.5 was never released; its changes are included here.
-
 Breaking changes (migrating from 1.x)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -14,23 +11,8 @@ Breaking changes (migrating from 1.x)
 supported (1.0.4 required Airflow 2.10 or later).
 
 **Python 3.12, 3.13 and 3.14 are supported; Python 3.10 and 3.11 are not.**
-On Python older than 3.12, every ``yellowdog-sdk`` release caps
-``urllib3<2``, which conflicts with the Apache Airflow constraints files
-(which pin urllib3 2.x), so the provider cannot be installed the recommended
-way on 3.10 or 3.11. Python 3.10 is also end-of-life. 1.0.4 supported
-Python 3.10 to 3.12.
 
-Before (1.0.4)::
-
-   requires-python = ">= 3.10, < 3.13"
-   apache-airflow>=2.10.0
-
-After (2.0.0)::
-
-   requires-python = ">=3.12, <3.15"
-   apache-airflow>=3.1
-
-The YellowDog SDK requirement is unchanged: ``yellowdog-sdk>=15.2.0``.
+**YellowDog SDK 15.10.0 or later is required** (1.0.4 required 15.2.0).
 
 **Operators and sensors take keyword arguments only.** Positional arguments
 (such as ``task_id`` and ``connection_id``) are no longer accepted.

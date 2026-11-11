@@ -12,7 +12,7 @@ The main documentation is found at: https://docs.yellowdog.ai/airflow-provider/i
 
 ## Requirements
 
-Requires Apache Airflow 3.1 or later, Python 3.12, 3.13 or 3.14, and the [YellowDog SDK](https://pypi.org/project/yellowdog-sdk) (v15.2.0 or later, installed automatically).
+Requires Apache Airflow 3.1 or later, Python 3.12, 3.13 or 3.14, and the [YellowDog SDK](https://pypi.org/project/yellowdog-sdk) (v15.10.0 or later, installed automatically).
 
 Upgrading from 1.x? See the [changelog and migration guide](docs/changelog.rst).
 
