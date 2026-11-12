@@ -82,6 +82,17 @@ def test_example_dag_three_task_shape():
     }
 
 
+def test_teardown_cancels_its_scope():
+    stop = _main_dag().task_dict["shutdown-worker-pool"]
+    assert isinstance(stop, ShutdownProvisionedWorkerPool)
+    assert stop.cancel_work_requirements == "scope"
+    assert stop._teardown_scope_task_ids() == [
+        "provision-worker-pool",
+        "run-work-requirement-1",
+        "run-work-requirement-2",
+    ]
+
+
 def test_teardown_uses_pool_id_from_xcom():
     stop = _main_dag().task_dict["shutdown-worker-pool"]
     assert stop.worker_pool_id == (

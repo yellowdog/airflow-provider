@@ -2,7 +2,7 @@
 
 The YellowDog Provider for Apache Airflow provides:
 
-- Operators for the usual three-task DAG: provision a YellowDog Worker Pool (a setup task that waits until the pool is ready), run Work Requirements on it (`RunWorkRequirement` submits and waits until the work completes), and shut the pool down (a teardown task that also cancels the DAG run's unfinished work)
+- Operators for the usual three-task DAG: provision a YellowDog Worker Pool (a setup task that waits until the pool is ready), run Work Requirements on it (`RunWorkRequirement` submits and waits until the work completes), and shut the pool down (a teardown task that also cancels the unfinished work of its setup/teardown scope)
 - Finer-grained operators to submit, extend and cancel Work Requirements step by step
 - Sensor classes to monitor the states of YellowDog Work Requirements, Worker Pools and Compute Requirements
 - Deferrable waits: operators and sensors can hand their waits to Airflow's triggerer instead of holding a worker slot

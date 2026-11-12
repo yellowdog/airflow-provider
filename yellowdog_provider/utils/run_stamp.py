@@ -2,7 +2,7 @@
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from airflow.sdk import Context
 
@@ -29,6 +29,19 @@ _EDGE_CHARS = "-_"
 
 RUN_TAG_PREFIX_PATTERN = re.compile(rf"{_TAG_PREFIX}:[0-9a-f]{{{_DIGEST_LENGTH}}}")
 """Matches (with ``fullmatch``) a :meth:`RunStamp.run_tag_prefix` value."""
+
+TASK_TAG_PREFIX_PATTERN = re.compile(
+    rf"{_TAG_PREFIX}:[0-9a-f]{{{_DIGEST_LENGTH}}}:[0-9a-f]{{{_DIGEST_LENGTH}}}"
+)
+"""Matches (with ``fullmatch``) a :meth:`RunStamp.task_tag_prefix` value."""
+
+INSTANCE_TAG_PREFIX_PATTERN = re.compile(
+    rf"{TASK_TAG_PREFIX_PATTERN.pattern}:m-?[0-9]+"
+)
+"""
+Matches (with ``fullmatch``) a task tag prefix for one map index,
+``<task_tag_prefix()>:m<map_index>``: a :meth:`RunStamp.tag` value.
+"""
 
 
 def _digest(*parts: str | int, length: int = _DIGEST_LENGTH) -> str:
@@ -68,7 +81,7 @@ class RunStamp:
     ``deployment_id`` distinguishes Airflow deployments that share YellowDog
     credentials (and so could have DAG runs with the same DAG and run IDs);
     when non-empty, it is part of both digests (:meth:`run_tag_prefix` and
-    :meth:`tag`). When empty, the stamp is the same as without it.
+    :meth:`task_tag_prefix`). When empty, the stamp is the same as without it.
     """
 
     dag_id: str
@@ -105,10 +118,30 @@ class RunStamp:
         digest = _digest(*self._deployment(), self.dag_id, self.run_id)
         return f"{_TAG_PREFIX}:{digest}"
 
-    def tag(self) -> str:
-        """Tag unique to this task (and map index) within the DAG run."""
-        digest = _digest(*self._deployment(), self.task_id, self.map_index)
+    def task_tag_prefix(self) -> str:
+        """
+        Tag prefix shared by every work requirement of this task within the
+        DAG run, whatever the map index:
+        ``airflow:<run digest>:<task digest>``, where the task digest covers
+        the task ID (and the deployment ID, if set) but not the map index.
+        """
+        digest = _digest(*self._deployment(), self.task_id)
         return f"{self.run_tag_prefix()}:{digest}"
+
+    def tag(self) -> str:
+        """
+        Tag unique to this task and map index within the DAG run:
+        ``<task_tag_prefix()>:m<map_index>`` (``m-1`` if not mapped).
+        """
+        return f"{self.task_tag_prefix()}:m{self.map_index}"
+
+
+def task_tag_prefix_for(stamp: RunStamp, task_id: str) -> str:
+    """
+    The :meth:`RunStamp.task_tag_prefix` of another task, ``task_id``, in the
+    same DAG run (same DAG ID, run ID and deployment ID) as ``stamp``.
+    """
+    return replace(stamp, task_id=task_id, map_index=-1).task_tag_prefix()
 
 
 def _shorten(raw: str, limit: int) -> str:

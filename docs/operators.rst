@@ -528,9 +528,9 @@ aborted as well.
 transition (for example, the work requirement has already completed or been
 cancelled), the operator logs a warning and succeeds. This makes it safe to
 use as a teardown task. Any other error from YellowDog fails the task.
-(``ShutdownProvisionedWorkerPool`` already cancels the DAG run's unfinished
-work requirements, so a separate cancel task is needed only for work that is
-not run on a pool the DAG shuts down.)
+(``ShutdownProvisionedWorkerPool`` already cancels the unfinished work
+requirements of its setup/teardown scope, so a separate cancel task is needed
+only for work outside every such scope.)
 
 **Returns:** the ID of the work requirement (``str``).
 
@@ -701,9 +701,9 @@ unfinished work requirements.
      - ``False``
      - no
      - no
-   * - ``cancel_run_work_requirements``
-     - ``bool``
-     - ``True``
+   * - ``cancel_work_requirements``
+     - ``"scope" | "run" | "none"``
+     - ``"scope"``
      - no
      - no
    * - ``wait``
@@ -736,17 +736,28 @@ unfinished work requirements.
 compute requirement is also terminated straight away, so its instances are
 stopped and any tasks still running on them fail.
 
-**cancel_run_work_requirements.** With ``True`` (the default), before shutting
-the pool down the operator cancels, with abort, every unfinished work
-requirement submitted by any task of the *same DAG run*, in every namespace
-the credentials can see. It recognises them by the run stamp in their tag, so
-other runs' work and work not submitted by the provider are never touched.
-Failures are logged and the shutdown goes ahead. **The cancellation covers
-the whole DAG run, from any task:** set this to ``False`` when other pool
-scopes or other work run concurrently in the same DAG run (for example a CPU
-pool and a GPU pool each with their own setup and teardown, or a
-``RunWorkRequirement`` on an existing pool in a parallel branch); otherwise
-the first teardown to run aborts the other branch's work. See
+**cancel_work_requirements.** Before shutting the pool down, the operator
+cancels, with abort, unfinished work requirements submitted in the *same DAG
+run*, in every namespace the credentials can see:
+
+- ``"scope"`` (the default): those submitted by the tasks in this teardown's
+  setup/teardown scope, that is its setups and every task downstream of a
+  setup and upstream of the teardown (every map index of a mapped task;
+  inside a mapped task group, each teardown instance covers only its own map
+  instance of the group's tasks).
+  Parallel scopes, for example a CPU pool and a GPU pool each with its own
+  setup and teardown, leave each other's work alone. If the operator is not a
+  teardown (``as_teardown(...)``) or has no setups, it cancels nothing and
+  logs a warning.
+- ``"run"``: those submitted by any task of the DAG run.
+- ``"none"``: nothing.
+
+Any other value raises ``YellowDogArgumentError`` when the DAG is parsed. The
+work requirements are recognised by the run stamp in their tag, so other
+runs' work and work not submitted by the provider are never touched. Failures
+are logged and the shutdown goes ahead. Under ``"scope"``, a task outside
+every scope (for example a ``RunWorkRequirement`` on an existing pool) is not
+cleaned up after a worker crash; use ``"run"`` to cover it. See
 :ref:`teardown-cancellation`, and set :ref:`deployment_id <deployment-id>` if
 several Airflow environments share the YellowDog account.
 

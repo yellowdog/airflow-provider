@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Collection, Sequence
 from datetime import timedelta
 from enum import Enum
-from typing import Any, NoReturn, cast
+from typing import Any, Literal, NoReturn, cast, get_args
 
 from airflow.sdk import BaseOperator, BaseOperatorLink, Context
 from yellowdog_client.model import (
@@ -48,7 +48,7 @@ from yellowdog_provider.triggers.yellowdog_triggers import (
     YellowDogStateTrigger,
 )
 from yellowdog_provider.utils.airflow_compat import conf
-from yellowdog_provider.utils.run_stamp import RunStamp
+from yellowdog_provider.utils.run_stamp import RunStamp, task_tag_prefix_for
 from yellowdog_provider.utils.templating import (
     Templated,
     resolve,
@@ -582,7 +582,7 @@ class RunWorkRequirement(_WorkRequirementSubmitter):
     **Clearing re-runs the work.** A completed earlier attempt is submitted
     again as a fresh copy when the task instance has been *cleared* since it
     was submitted, but not on an automatic retry. Each submission records the
-    task instance's *clear cycle* in its tag (``<stamp>:c<cycle>``), and the
+    task instance's *clear cycle* in its tag (``<stamp.tag()>:c<cycle>``), and the
     cycle is the task instance's Airflow ``max_tries``: Airflow raises
     ``max_tries`` (to ``<last try> + retries``) whenever it clears a task
     instance and leaves it unchanged on retries (verified for Airflow 3.1 and
@@ -619,9 +619,9 @@ class RunWorkRequirement(_WorkRequirementSubmitter):
     only gap is a task killed in the moment between the work requirement's
     creation and the operator recording its ID (inside the submission),
     which is not cleaned up. For these cases, use a
-    teardown such as :class:`ShutdownProvisionedWorkerPool`, which cancels
-    the DAG run's unfinished work requirements
-    (``cancel_run_work_requirements``).
+    teardown such as :class:`ShutdownProvisionedWorkerPool` whose
+    setup/teardown scope includes this task: it cancels the unfinished work
+    requirements of the tasks in its scope (``cancel_work_requirements``).
 
     :param task_id: the Airflow task ID
     :type task_id: str
@@ -1255,6 +1255,12 @@ class ProvisionWorkerPool(YellowDogOperator):
         )
 
 
+CancelWorkRequirements = Literal["scope", "run", "none"]
+"""The ``cancel_work_requirements`` values of :class:`ShutdownProvisionedWorkerPool`."""
+
+_CANCEL_WORK_REQUIREMENTS: tuple[str, ...] = get_args(CancelWorkRequirements)
+
+
 class ShutdownProvisionedWorkerPool(YellowDogOperator):
     """
     Shuts down a YellowDog provisioned worker pool, and optionally
@@ -1276,20 +1282,31 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
     terminated (with ``terminate_immediately``) and the task then fails.
     All arguments are keyword-only.
 
-    **Run-scoped cancellation.** Before shutting the pool down, the operator
-    (with ``cancel_run_work_requirements``, the default) cancels, aborting
-    running tasks, every unfinished work requirement, in any namespace
-    visible to the connection's credentials, that was submitted by any task
-    of *this DAG run* (identified by the run stamp in its ``tag``; see
-    :meth:`~yellowdog_provider.utils.run_stamp.RunStamp.run_tag_prefix`).
-    Work requirements of other DAG runs, or not submitted by this provider,
-    are never touched. If several Airflow deployments share the same
-    YellowDog credentials, give each a distinct ``[yellowdog]
-    deployment_id`` setting, so that runs with the same DAG and run IDs in
-    different deployments are told apart. Used as the
-    teardown of the DAG run's work, this cleans up work left running by
-    killed deferred tasks or crashed workers. Cancellation is best-effort: a
-    failure is logged and the shutdown goes ahead.
+    **Scoped cancellation.** Before shutting the pool down, the operator
+    cancels, aborting running tasks, unfinished work requirements, in any
+    namespace visible to the connection's credentials, that were submitted
+    by tasks of *this DAG run* (identified by the run stamp in their
+    ``tag``; see :meth:`~yellowdog_provider.utils.run_stamp.RunStamp.tag`).
+    ``cancel_work_requirements`` chooses which: with ``"scope"`` (the
+    default), those of the tasks in this teardown's setup/teardown scope
+    (its setups, and the tasks downstream of a setup and upstream of the
+    teardown; every map index of a mapped task, except that in a mapped
+    task group each teardown instance covers only its own map instance of
+    the tasks in that group); with ``"run"``, those of
+    every task of the DAG run; with ``"none"``, none. Under ``"scope"``, an
+    operator that is not a teardown (``as_teardown``) or has no setups
+    cancels nothing and logs a warning. Work requirements of other DAG runs,
+    or not submitted by this provider, are never touched. If several
+    Airflow deployments share the same YellowDog credentials, give each a
+    distinct ``[yellowdog] deployment_id`` setting, so that runs with the
+    same DAG and run IDs in different deployments are told apart. Used as
+    the teardown of the work, this cleans up work left running by killed
+    deferred tasks or crashed workers. A task outside every scope
+    (for example a :class:`RunWorkRequirement` on an existing pool) still
+    cancels its own work on failure, timeout or kill, but its work left
+    running after a worker crash is only cleaned up with ``"run"``.
+    Cancellation is best-effort: a failure is logged and the shutdown goes
+    ahead.
 
     **Waiting.** With ``wait``, the operator pushes the pool ID to XCom (key
     ``return_value``), waits until the pool is SHUTDOWN or TERMINATED and,
@@ -1332,16 +1349,13 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
         default_deferrable`` setting (false unless configured), read when the
         operator is constructed. Only used with ``wait``
     :type deferrable: bool | None
-    :param cancel_run_work_requirements: first cancel this DAG run's
-        unfinished work requirements, in any namespace (default
-        ``True``). The cancellation covers the whole DAG run, from any task:
-        set this to ``False`` when other pool scopes or other work run
-        concurrently in the same DAG run (for example a CPU pool and a GPU
-        pool each with their own setup and teardown, or a
-        :class:`RunWorkRequirement` on an existing pool in a parallel
-        branch); otherwise the first teardown to run aborts the other
-        branch's work
-    :type cancel_run_work_requirements: bool
+    :param cancel_work_requirements: which of this DAG run's unfinished
+        work requirements to cancel first, in any namespace: ``"scope"``
+        (the default) for those of the tasks in this teardown's
+        setup/teardown scope, ``"run"`` for the whole DAG run, or ``"none"``.
+        Any other value raises :exc:`.YellowDogArgumentError` (at DAG parse
+        time)
+    :type cancel_work_requirements: Literal["scope", "run", "none"]
 
     :return: the YellowDog ID of the worker pool that was shut down
     :rtype: str
@@ -1367,7 +1381,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
         poke_interval: float = 30,  # Seconds
         timeout: float = 3600,  # Seconds
         deferrable: bool | None = None,
-        cancel_run_work_requirements: bool = True,
+        cancel_work_requirements: CancelWorkRequirements = "scope",
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -1377,6 +1391,12 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
             worker_pool_id,
             {"namespace": namespace, "worker_pool_name": worker_pool_name},
         )
+        if cancel_work_requirements not in _CANCEL_WORK_REQUIREMENTS:
+            raise YellowDogArgumentError(
+                f"cancel_work_requirements must be one of "
+                f"{', '.join(repr(v) for v in _CANCEL_WORK_REQUIREMENTS)}, "
+                f"not {cancel_work_requirements!r}"
+            )
         self.worker_pool_id = worker_pool_id
         self.namespace = namespace
         self.worker_pool_name = worker_pool_name
@@ -1385,11 +1405,12 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
         self.poke_interval: float = float(poke_interval)
         self.timeout: float = float(timeout)
         self.deferrable: bool = _default_deferrable(deferrable)
-        self.cancel_run_work_requirements: bool = cancel_run_work_requirements
+        self.cancel_work_requirements: CancelWorkRequirements = cancel_work_requirements
 
     def execute(self, context: Context) -> str:
         """
-        Cancels this DAG run's unfinished work requirements (if enabled),
+        Cancels unfinished work requirements of this DAG run (see
+        ``cancel_work_requirements``),
         shuts down the worker pool, optionally terminates its compute
         requirement, and optionally waits for both.
         """
@@ -1418,8 +1439,8 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
                 )
 
             pool_id = cast(str, worker_pool.id)
-            if self.cancel_run_work_requirements:
-                self._cancel_run_work_requirements(hook, context)
+            if self.cancel_work_requirements != "none":
+                self._cancel_work_requirements(hook, context)
 
             cr_id = hook.shutdown_worker_pool(
                 pool_id, terminate_immediately=self.terminate_immediately
@@ -1490,30 +1511,116 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
                 hook, pool_id, compute_requirement_id, deadline, pool_done=True
             )
 
-    def _cancel_run_work_requirements(
-        self, hook: YellowDogHook, context: Context
-    ) -> None:
+    def _teardown_scope_task_ids(self) -> list[str] | None:
+        """
+        The (sorted) task IDs in this teardown's setup/teardown scope: its
+        setups (direct upstream tasks that are setups) and every task both
+        downstream of one of them and upstream of this task, not including
+        this task. ``None`` if this task is not a teardown or has no setups.
+        """
+        if not self.is_teardown:
+            return None
+        relatives = self.get_flat_relatives(upstream=True)
+        setups = [
+            task
+            for task in relatives
+            if task.is_setup and task.task_id in self.upstream_task_ids
+        ]
+        if not setups:
+            return None
+        upstream = {task.task_id for task in relatives}
+        # Nested setups and teardowns fall in the scope too; harmless, as they
+        # submit no work requirements.
+        scope = {setup.task_id for setup in setups}
+        for setup in setups:
+            scope.update(
+                task.task_id
+                for task in setup.get_flat_relatives(upstream=False)
+                if task.task_id in upstream
+            )
+        scope.discard(self.task_id)
+        return sorted(scope)
+
+    def _scope_tag_prefixes(self, stamp: RunStamp, task_ids: list[str]) -> list[str]:
+        """
+        The tag prefixes of the scope tasks ``task_ids``: each task's
+        :func:`.task_tag_prefix_for` (every map index), except that, when this
+        teardown is in a mapped task group, the tasks in that same group get
+        ``<task prefix>:m<map index>`` for this teardown's own map index, as
+        Airflow runs each instance of the teardown once its own group
+        instance's tasks are done, while the others may still be running.
+        Tasks in a mapped group nested in that group keep the plain prefix.
+        """
+        group = self.get_closest_mapped_task_group()
+        # Only tasks whose closest mapped group is this one share its map
+        # index; a task in a nested mapped group has its own (flat) map
+        # indices, so it keeps the plain prefix (over-cancels, never misses).
+        in_group = (
+            set[str]()
+            if group is None
+            else {
+                task.task_id
+                for task in group.iter_tasks()
+                if (closest := task.get_closest_mapped_task_group()) is not None
+                and closest.group_id == group.group_id
+            }
+        )
+        return [
+            task_tag_prefix_for(stamp, task_id)
+            + (f":m{stamp.map_index}" if task_id in in_group else "")
+            for task_id in task_ids
+        ]
+
+    def _cancel_work_requirements(self, hook: YellowDogHook, context: Context) -> None:
         """
         Best-effort cancel (with abort) of this DAG run's unfinished work
-        requirements in every visible namespace: failures are logged, never
-        raised.
+        requirements in every visible namespace, those of the tasks in this
+        teardown's scope or of the whole run (``cancel_work_requirements``):
+        failures are logged, never raised.
         """
+        mode = self.cancel_work_requirements
         try:
-            prefix = RunStamp.from_context(context).run_tag_prefix()
-            wr_ids = hook.find_unfinished_run_work_requirements(None, prefix)
+            stamp = RunStamp.from_context(context)
+            task_prefixes: list[str] | None = None
+            if mode == "scope":
+                task_ids = self._teardown_scope_task_ids()
+                if task_ids is None:
+                    self.log.warning(
+                        "Task '%s' is not a teardown with setups, so it has no "
+                        "setup/teardown scope; no work requirements cancelled. "
+                        "Use cancel_work_requirements='run' to cancel the whole "
+                        "DAG run's, or make it a teardown "
+                        "(as_teardown(setups=...))",
+                        self.task_id,
+                    )
+                    return
+                self.log.info(
+                    "Setup/teardown scope: %s", ", ".join(repr(t) for t in task_ids)
+                )
+                task_prefixes = self._scope_tag_prefixes(stamp, task_ids)
+            wr_ids = hook.find_unfinished_run_work_requirements(
+                None, stamp.run_tag_prefix(), task_prefixes
+            )
         except Exception:
             self.log.exception(
                 "Could not look up this DAG run's unfinished work requirements; "
                 "none cancelled"
             )
             return
+        where = "this DAG run" if mode == "run" else "this teardown's scope"
         if not wr_ids:
-            self.log.info("No unfinished work requirements of this DAG run")
+            self.log.info(
+                "No unfinished work requirements of %s (cancel_work_requirements='%s')",
+                where,
+                mode,
+            )
             return
         self.log.warning(
-            "Cancelling %d unfinished work requirement(s) of this DAG run, "
-            "aborting running tasks",
+            "Cancelling %d unfinished work requirement(s) of %s "
+            "(cancel_work_requirements='%s'), aborting running tasks",
             len(wr_ids),
+            where,
+            mode,
         )
         for wr_id in wr_ids:
             try:

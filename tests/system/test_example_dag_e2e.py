@@ -411,6 +411,23 @@ def _dump_diagnostics(container: str, run_id: str, task_states: bool) -> None:
     try:
         if task_states:
             _task_states(container, run_id)
+        # The run's task logs (last lines of each attempt): the container is
+        # removed after the test, and its own log has no task output
+        task_logs = _run(
+            [
+                "docker",
+                "exec",
+                container,
+                "sh",
+                "-c",
+                'for f in "${AIRFLOW_HOME:-/opt/airflow}"/logs/dag_id=*/'
+                'run_id="$1"/task_id=*/attempt=*.log; do '
+                '[ -f "$f" ] && echo "== $f" && tail -n 60 "$f"; done',
+                "sh",
+                run_id,
+            ]
+        )
+        print(f"\nTask logs:\n{task_logs.stdout}{task_logs.stderr}")
         logs = _run(["docker", "logs", "--tail", "200", container])
         print(f"\nContainer log tail:\n{logs.stdout}{logs.stderr}")
     except Exception as e:

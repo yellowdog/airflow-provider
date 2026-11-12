@@ -23,11 +23,11 @@ as a setup task, the new ``RunWorkRequirement`` for the work, and
 - **Nothing left running.** Operators cancel their work requirement (aborting
   running tasks) or terminate their unready pool when they time out, fail
   while waiting, or are killed, or fail partway through a submission; the
-  teardown cancels any of the DAG run's work still running. This covers the
-  whole DAG run: set ``cancel_run_work_requirements=False`` on a teardown
-  when other pool scopes or other work run concurrently in the same DAG run
-  (for example a CPU pool and a GPU pool each with their own teardown), or
-  the first teardown aborts the other branch's work.
+  teardown cancels any work still running in its setup/teardown scope, so
+  parallel scopes in one DAG run (for example a CPU pool and a GPU pool,
+  each with its own setup and teardown) leave each other's work alone;
+  inside a mapped task group, each teardown instance covers only its own map
+  instance of the group's tasks.
 
 New: YellowDog Portal links
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -94,11 +94,12 @@ raises :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogExcept
 succeeded. Configured worker pools already raised. The return value is now
 always the worker pool ID (``str``).
 
-**Templated IDs that render to "None" raise :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError`.** When an
-upstream XCom value is missing, a templated field such as
+**Templated IDs that render to "None" raise an error.** When an upstream
+XCom value is missing, a templated field such as
 ``"{{ ti.xcom_pull(task_ids='x') }}"`` renders to the string ``"None"``. 1.0.4
 used it as a real ID and failed later with an obscure platform error;
-2.0.0 fails immediately with a clear message. Empty strings are treated as
+2.0.0 fails immediately with a clear message, raising
+:exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError`. Empty strings are treated as
 not supplied.
 
 **A missing ID or name fails when the DAG is parsed.** Operators and sensors
@@ -121,7 +122,7 @@ empty ``target_states``.
 :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError` subclasses both :exc:`~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogException` and
 ``ValueError``, so existing ``except YellowDogException`` handlers still work.
 
-**Sensor subclassing: ``target_states_names`` removed.** The public
+**Sensor subclassing: target_states_names removed.** The public
 ``target_states_names`` attribute no longer exists on the three state sensors,
 and ``YellowDogSensor.check_status`` no longer takes a ``target_states_names``
 parameter (it logs the names derived from ``target_states``). This affects
@@ -213,7 +214,7 @@ should use the ID from XCom.
 **The work requirement's tag is replaced by the run stamp.**
 ``RunWorkRequirement``, ``AddWorkRequirement`` and
 ``AddPopulatedWorkRequirement`` set the submitted work requirement's ``tag``
-to ``airflow:<12 hex>:<12 hex>:c<cycle>``; a ``tag`` you set on the
+to ``airflow:<12 hex>:<12 hex>:m<map index>:c<cycle>``; a ``tag`` you set on the
 ``WorkRequirement`` is overwritten (a warning is logged). 1.0.4 sent your tag
 unchanged. Record such information elsewhere, for example in the name.
 
@@ -234,14 +235,25 @@ is raised.
 while it runs, its work requirement is cancelled, aborting running tasks
 (best effort). 1.0.4 left it running.
 
-**ShutdownProvisionedWorkerPool first cancels the DAG run's unfinished work
-requirements.** By default (``cancel_run_work_requirements=True``), before
-shutting the pool down it cancels, with abort, every unfinished work
-requirement submitted by any task of the same DAG run, in every namespace the
-credentials can see (recognised by the run stamp; other runs' work and work
-not submitted by the provider are never touched). 1.0.4 only shut the pool
-down. If several Airflow environments share a YellowDog account, set
-``[yellowdog] deployment_id`` in each (see :ref:`deployment-id`).
+**ShutdownProvisionedWorkerPool first cancels the unfinished work
+requirements of its scope.** By default (``cancel_work_requirements="scope"``),
+before shutting the pool down it cancels, with abort, every unfinished work
+requirement submitted in the same DAG run by a task in its setup/teardown
+scope (its setups, and the tasks between them and the teardown), in every
+namespace the credentials can see (recognised by the run stamp; other runs'
+work, other scopes' work and work not submitted by the provider are never
+touched); inside a mapped task group, each teardown instance covers only its
+own map instance of the group's tasks. ``"run"`` cancels the whole DAG run's
+instead. A ``ShutdownProvisionedWorkerPool`` that is not a teardown with
+setups cancels nothing under ``"scope"`` and logs a warning (see
+:ref:`teardown-cancellation`); a 1.x DAG with a plain shutdown task (not
+``as_teardown``) should make it a teardown of the provisioning task
+(``.as_teardown(setups=provision)``), or pass
+``cancel_work_requirements="run"`` (cancel the whole run's work) or
+``"none"`` (cancel nothing, as 1.0.4) to silence the warning. 1.0.4 only
+shut the pool down. If several
+Airflow environments share a YellowDog account, set ``[yellowdog]
+deployment_id`` in each (see :ref:`deployment-id`).
 
 .. code-block:: python
 
@@ -252,7 +264,7 @@ down. If several Airflow environments share a YellowDog account, set
    ShutdownProvisionedWorkerPool(
        task_id="shutdown",
        worker_pool_id=pool_id,
-       cancel_run_work_requirements=False,
+       cancel_work_requirements="none",
    )
 
 **ShutdownProvisionedWorkerPool succeeds if the pool is already shut down.**
@@ -300,7 +312,8 @@ Added
   never becomes ready.
 * ``ShutdownProvisionedWorkerPool`` arguments ``wait`` (default ``False``),
   ``poke_interval``, ``timeout``, ``deferrable`` and
-  ``cancel_run_work_requirements`` (default ``True``; see above).
+  ``cancel_work_requirements`` (``"scope"``, the default, ``"run"`` or
+  ``"none"``; see above).
 * ``deferrable`` on the three sensors, and
   :class:`~yellowdog_provider.triggers.yellowdog_triggers.YellowDogStateTrigger`,
   the trigger behind all deferred waits. On Airflow 3.3 and later (verified on

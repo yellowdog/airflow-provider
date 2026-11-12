@@ -2,10 +2,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import timedelta
 from itertools import chain, repeat
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from airflow.sdk import DAG, TaskGroup, task_group
 from requests import HTTPError
 from yellowdog_client.model import (
     ComputeRequirementStatus,
@@ -18,7 +19,7 @@ from yellowdog_client.model import (
 )
 from yellowdog_client.model.exceptions import InvalidRequestException
 
-from tests.support import make_context, render
+from tests.support import NoOp, make_context, render
 from tests.unit.hooks.test_hook_operations import FakePlatform
 from yellowdog_provider.exceptions.yellowdog_exceptions import (
     WaitTimeoutError,
@@ -423,10 +424,11 @@ def platform(mock_client: MagicMock) -> FakePlatform:
 
 
 def _shutdown(**kw: Any) -> ShutdownProvisionedWorkerPool:
+    kw.setdefault("task_id", "t")
     kw.setdefault("worker_pool_id", "wp-1")
     kw.setdefault("poke_interval", 0)
     kw.setdefault("deferrable", False)
-    return ShutdownProvisionedWorkerPool(task_id="t", **kw)
+    return ShutdownProvisionedWorkerPool(**kw)
 
 
 def _cancelled(platform: FakePlatform) -> list[Any]:
@@ -436,7 +438,7 @@ def _cancelled(platform: FakePlatform) -> list[Any]:
 def test_shutdown_defaults() -> None:
     with patch.object(ops.conf, "getboolean", return_value=False):
         op = ShutdownProvisionedWorkerPool(task_id="t", worker_pool_id="wp-1")
-    assert (op.wait, op.cancel_run_work_requirements) == (False, True)
+    assert (op.wait, op.cancel_work_requirements) == (False, "scope")
     assert (op.poke_interval, op.timeout, op.deferrable) == (30, 3600, False)
 
 
@@ -453,7 +455,7 @@ def test_shutdown_cancels_unfinished_run_work_requirements(
     running = platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
     held = platform.existing("b", STAMP, WorkRequirementStatus.HELD, cycle=3)
     platform.existing("c", STAMP, WorkRequirementStatus.COMPLETED)
-    assert _exec(_shutdown()) == "wp-1"
+    assert _exec(_shutdown(cancel_work_requirements="run")) == "wp-1"
     assert sorted(_cancelled(platform)) == sorted(
         [call(running.id, True), call(held.id, True)]
     )
@@ -482,7 +484,7 @@ def test_teardown_cancels_only_this_runs_work(platform: FakePlatform) -> None:
         RunStamp("test_dag", "test_run", "run", -1, deployment_id="prod"),
         WorkRequirementStatus.RUNNING,
     )
-    _exec(_shutdown())
+    _exec(_shutdown(cancel_work_requirements="run"))
     assert sorted(_cancelled(platform)) == sorted(
         [call(mine.id, True), call(mine_elsewhere.id, True)]
     )
@@ -490,11 +492,237 @@ def test_teardown_cancels_only_this_runs_work(platform: FakePlatform) -> None:
         assert wr.status == WorkRequirementStatus.RUNNING
 
 
-def test_shutdown_cancel_disabled(platform: FakePlatform) -> None:
+def test_shutdown_cancel_none(platform: FakePlatform) -> None:
     platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
-    _exec(_shutdown(cancel_run_work_requirements=False))
+    _exec(_shutdown(cancel_work_requirements="none"))
     platform.work.get_work_requirements.assert_not_called()
     platform.work.cancel_work_requirement_by_id.assert_not_called()
+
+
+def _scope_exec(op: ShutdownProvisionedWorkerPool) -> Any:
+    """Run the teardown ``op`` (in a DAG) as its own task in this DAG run."""
+    ctx = make_context(task_id=op.task_id)
+    render(op, ctx)
+    return op.execute(ctx)
+
+
+def _two_scopes(
+    **kw: Any,
+) -> tuple[ShutdownProvisionedWorkerPool, ShutdownProvisionedWorkerPool]:
+    """
+    A DAG with two parallel setup/teardown scopes, s1 >> w1 >> t1 and
+    s2 >> w2 >> t2, plus a task after t1; returns the teardowns (t1, t2).
+    """
+    with DAG("test_dag", schedule=None):
+        s1, w1, s2, w2, after = (
+            NoOp(task_id=i) for i in ("s1", "w1", "s2", "w2", "after")
+        )
+        t1 = _shutdown(task_id="t1", **kw)
+        t2 = _shutdown(task_id="t2", **kw)
+        _ = s1 >> w1 >> t1.as_teardown(setups=s1)
+        _ = s2 >> w2 >> t2.as_teardown(setups=s2)
+        _ = t1 >> after
+    return t1, t2
+
+
+def _task(task_id: str, map_index: int = -1) -> RunStamp:
+    """The stamp of ``task_id`` in this DAG run."""
+    return RunStamp(STAMP.dag_id, STAMP.run_id, task_id, map_index)
+
+
+def test_teardown_scope_task_ids_is_own_branch() -> None:
+    t1, t2 = _two_scopes()
+    assert t1._teardown_scope_task_ids() == ["s1", "w1"]
+    assert t2._teardown_scope_task_ids() == ["s2", "w2"]
+
+
+def test_teardown_scope_cancels_only_own_scope(
+    platform: FakePlatform, capsys: pytest.CaptureFixture[str]
+) -> None:
+    t1, _ = _two_scopes()
+    setup = platform.existing("s1", _task("s1"), WorkRequirementStatus.RUNNING)
+    work = platform.existing("w1", _task("w1"), WorkRequirementStatus.HELD, cycle=2)
+    other = platform.existing("w2", _task("w2"), WorkRequirementStatus.RUNNING)
+    after = platform.existing("after", _task("after"), WorkRequirementStatus.RUNNING)
+    with patch.object(
+        YellowDogHook,
+        "find_unfinished_run_work_requirements",
+        autospec=True,
+        side_effect=YellowDogHook.find_unfinished_run_work_requirements,
+    ) as find:
+        assert _scope_exec(t1) == "wp-1"
+    assert find.call_args.args[1:] == (
+        None,
+        STAMP.run_tag_prefix(),
+        [_task("s1").task_tag_prefix(), _task("w1").task_tag_prefix()],
+    )
+    assert sorted(_cancelled(platform)) == sorted(
+        [call(setup.id, True), call(work.id, True)]
+    )
+    for wr in (other, after):
+        assert wr.status == WorkRequirementStatus.RUNNING
+    out = capsys.readouterr().out  # Task logs go to stdout
+    assert "Setup/teardown scope: 's1', 'w1'" in out
+    assert "Cancelling 2 unfinished work requirement(s) of this teardown's scope" in out
+
+
+def test_teardown_scope_in_task_group_uses_qualified_ids(
+    platform: FakePlatform,
+) -> None:
+    with DAG("test_dag", schedule=None), TaskGroup("grp"):
+        s = NoOp(task_id="s")
+        w = NoOp(task_id="w")
+        t = _shutdown(task_id="t")
+        _ = s >> w >> t.as_teardown(setups=s)
+    assert t._teardown_scope_task_ids() == ["grp.s", "grp.w"]
+    mine = platform.existing("w", _task("grp.w"), WorkRequirementStatus.RUNNING)
+    unqualified = platform.existing("u", _task("w"), WorkRequirementStatus.RUNNING)
+    _scope_exec(t)
+    assert _cancelled(platform) == [call(mine.id, True)]
+    assert unqualified.status == WorkRequirementStatus.RUNNING
+
+
+def test_teardown_scope_covers_every_map_index(platform: FakePlatform) -> None:
+    with DAG("test_dag", schedule=None):
+        s = NoOp(task_id="s")
+        w = NoOp.partial(task_id="w").expand(doc=["a", "b", "c"])
+        t = _shutdown(task_id="t")
+        _ = s >> w >> t.as_teardown(setups=s)
+    assert t._teardown_scope_task_ids() == ["s", "w"]
+    mapped = [
+        platform.existing(f"w{i}", _task("w", i), WorkRequirementStatus.RUNNING)
+        for i in (0, 1, 12)
+    ]
+    _scope_exec(t)
+    assert sorted(_cancelled(platform)) == sorted(call(m.id, True) for m in mapped)
+
+
+def _mapped_group_teardown() -> ShutdownProvisionedWorkerPool:
+    """
+    A DAG with a setup ``outer`` and a mapped task group ``grp`` (expanded
+    over 2) of s >> w >> t, t a teardown of s and outer; returns ``grp.t``.
+    """
+    with DAG("test_dag", schedule=None) as dag:
+        outer = NoOp(task_id="outer")
+
+        @task_group
+        def grp(x: int) -> None:
+            s = NoOp(task_id="s", doc=str(x))
+            w = NoOp(task_id="w")
+            t = _shutdown(task_id="t")
+            _ = outer >> s >> w >> t.as_teardown(setups=[outer, s])
+
+        _ = grp.expand(x=[1, 2])
+    return cast(ShutdownProvisionedWorkerPool, dag.get_task("grp.t"))
+
+
+def test_teardown_in_mapped_task_group_scopes_to_own_map_index(
+    platform: FakePlatform,
+) -> None:
+    t = _mapped_group_teardown()
+    assert t._teardown_scope_task_ids() == ["grp.s", "grp.w", "outer"]
+    outer = platform.existing("o", _task("outer"), WorkRequirementStatus.RUNNING)
+    work = {
+        i: platform.existing(f"w{i}", _task("grp.w", i), WorkRequirementStatus.RUNNING)
+        for i in (0, 1, 12)
+    }
+    with patch.object(
+        YellowDogHook,
+        "find_unfinished_run_work_requirements",
+        autospec=True,
+        side_effect=YellowDogHook.find_unfinished_run_work_requirements,
+    ) as find:
+        ctx = make_context(task_id=t.task_id, map_index=1)
+        render(t, ctx)
+        assert t.execute(ctx) == "wp-1"
+    assert find.call_args.args[1:] == (
+        None,
+        STAMP.run_tag_prefix(),
+        [
+            _task("grp.s", 1).tag(),
+            _task("grp.w", 1).tag(),
+            _task("outer").task_tag_prefix(),  # Outside the group: every index
+        ],
+    )
+    # m1 does not match m12
+    assert sorted(_cancelled(platform)) == sorted(
+        [call(outer.id, True), call(work[1].id, True)]
+    )
+    for i in (0, 12):
+        assert work[i].status == WorkRequirementStatus.RUNNING
+
+
+def test_teardown_run_cancels_whole_run(platform: FakePlatform) -> None:
+    t1, _ = _two_scopes(cancel_work_requirements="run")
+    wrs = [
+        platform.existing(i, _task(i), WorkRequirementStatus.RUNNING)
+        for i in ("w1", "w2", "after")
+    ]
+    with patch.object(
+        YellowDogHook,
+        "find_unfinished_run_work_requirements",
+        autospec=True,
+        side_effect=YellowDogHook.find_unfinished_run_work_requirements,
+    ) as find:
+        _scope_exec(t1)
+    assert find.call_args.args[1:] == (None, STAMP.run_tag_prefix(), None)
+    assert sorted(_cancelled(platform)) == sorted(call(w.id, True) for w in wrs)
+
+
+def test_teardown_none_looks_nothing_up(platform: FakePlatform) -> None:
+    t1, _ = _two_scopes(cancel_work_requirements="none")
+    platform.existing("w1", _task("w1"), WorkRequirementStatus.RUNNING)
+    assert _scope_exec(t1) == "wp-1"
+    platform.work.get_work_requirements.assert_not_called()
+    platform.work.cancel_work_requirement_by_id.assert_not_called()
+
+
+def _not_a_teardown() -> ShutdownProvisionedWorkerPool:
+    with DAG("test_dag", schedule=None):
+        s = NoOp(task_id="s")
+        t = _shutdown(task_id="t")
+        _ = s >> t
+    return t
+
+
+def _teardown_without_setups() -> ShutdownProvisionedWorkerPool:
+    with DAG("test_dag", schedule=None):
+        w = NoOp(task_id="w")
+        t = _shutdown(task_id="t")
+        _ = w >> t.as_teardown()
+    return t
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        _not_a_teardown,
+        _teardown_without_setups,
+        lambda: _shutdown(task_id="t"),  # Not in a DAG
+    ],
+)
+def test_scope_without_setups_warns_and_cancels_nothing(
+    platform: FakePlatform,
+    mock_client: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+    build: Any,
+) -> None:
+    op = build()
+    assert op._teardown_scope_task_ids() is None
+    platform.existing("w", _task("w"), WorkRequirementStatus.RUNNING)
+    assert _scope_exec(op) == "wp-1"
+    platform.work.get_work_requirements.assert_not_called()
+    platform.work.cancel_work_requirement_by_id.assert_not_called()
+    mock_client.worker_pool_client.shutdown_worker_pool_by_id.assert_called_once_with(
+        "wp-1"
+    )
+    assert "cancel_work_requirements='run'" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["all", "", None, True, "Scope"])
+def test_shutdown_rejects_bad_cancel_work_requirements(value: Any) -> None:
+    with pytest.raises(YellowDogArgumentError, match="cancel_work_requirements"):
+        _shutdown(cancel_work_requirements=value)
 
 
 def test_shutdown_cancel_failure_does_not_stop_shutdown(
@@ -503,7 +731,7 @@ def test_shutdown_cancel_failure_does_not_stop_shutdown(
     a = platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
     b = platform.existing("b", STAMP, WorkRequirementStatus.RUNNING)
     platform.work.cancel_work_requirement_by_id.side_effect = RuntimeError("boom")
-    assert _exec(_shutdown()) == "wp-1"
+    assert _exec(_shutdown(cancel_work_requirements="run")) == "wp-1"
     assert sorted(_cancelled(platform)) == sorted([call(a.id, True), call(b.id, True)])
     mock_client.worker_pool_client.shutdown_worker_pool_by_id.assert_called_once_with(
         "wp-1"
@@ -514,7 +742,7 @@ def test_shutdown_search_failure_does_not_stop_shutdown(
     platform: FakePlatform, mock_client: MagicMock
 ) -> None:
     platform.work.get_work_requirements.side_effect = RuntimeError("boom")
-    assert _exec(_shutdown()) == "wp-1"
+    assert _exec(_shutdown(cancel_work_requirements="run")) == "wp-1"
     mock_client.worker_pool_client.shutdown_worker_pool_by_id.assert_called_once()
 
 
@@ -526,7 +754,7 @@ def test_shutdown_configured_pool_cancels_nothing(
         ConfiguredWorkerPool
     )
     with pytest.raises(YellowDogException, match="configured worker pool"):
-        _exec(_shutdown())
+        _exec(_shutdown(cancel_work_requirements="run"))
     platform.work.cancel_work_requirement_by_id.assert_not_called()
 
 
@@ -819,3 +1047,31 @@ def test_teardown_other_terminate_errors_raise(
     terminate.side_effect = InvalidRequestException("Quota exceeded")
     with pytest.raises(InvalidRequestException, match="Quota"):
         _exec(_shutdown(terminate_immediately=True))
+
+
+def test_teardown_in_mapped_group_gives_nested_mapped_group_plain_prefix() -> None:
+    """
+    Tasks in a mapped group nested in the teardown's mapped group have their
+    own (flat) map indices, so they keep the plain task prefix.
+    """
+    with DAG("test_dag", schedule=None) as dag:
+
+        @task_group
+        def outer(x: int) -> None:
+            so = NoOp(task_id="so", doc=str(x))
+            t = _shutdown(task_id="t")
+
+            @task_group
+            def inner(y: int) -> None:
+                NoOp(task_id="w", doc=str(y))
+
+            _ = so >> inner.expand(y=[1, 2]) >> t.as_teardown(setups=so)
+
+        _ = outer.expand(x=[1, 2])
+    t = cast(ShutdownProvisionedWorkerPool, dag.get_task("outer.t"))
+    assert t._teardown_scope_task_ids() == ["outer.inner.w", "outer.so"]
+    stamp = _task("outer.t", 1)
+    assert t._scope_tag_prefixes(stamp, ["outer.inner.w", "outer.so"]) == [
+        _task("outer.inner.w").task_tag_prefix(),
+        _task("outer.so", 1).tag(),
+    ]

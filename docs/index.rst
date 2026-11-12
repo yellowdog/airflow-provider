@@ -26,7 +26,7 @@ The operators that submit work requirements (``RunWorkRequirement``,
 retry: a retry carries on with the earlier attempt's work instead of
 duplicating it (for the other operators, see :ref:`safe-retries`). Work is
 cancelled, with running tasks aborted, if a task gives up, is killed, or the
-DAG run's teardown finds it still running.
+teardown of its setup/teardown scope finds it still running.
 
 Operators and sensors take objects from the `YellowDog Python SDK
 <https://pypi.org/project/yellowdog-sdk>`_ (``WorkRequirement``, ``TaskGroup``,

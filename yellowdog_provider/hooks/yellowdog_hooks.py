@@ -6,7 +6,7 @@ import copy
 import hashlib
 import importlib
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from types import TracebackType
@@ -40,7 +40,9 @@ from yellowdog_provider.exceptions.yellowdog_exceptions import (
 )
 from yellowdog_provider.links.yellowdog_links import portal_base_from_api_url
 from yellowdog_provider.utils.run_stamp import (
+    INSTANCE_TAG_PREFIX_PATTERN,
     RUN_TAG_PREFIX_PATTERN,
+    TASK_TAG_PREFIX_PATTERN,
     RunStamp,
     derive_name,
     try_name,
@@ -92,7 +94,8 @@ def attempt_tag(stamp: RunStamp, cycle: int) -> str:
     """
     The tag of a work requirement submitted by the task ``stamp`` identifies,
     in clear cycle ``cycle`` (see :meth:`YellowDogHook.submit_work_requirement`):
-    ``<stamp.tag()>:c<cycle>``.
+    ``<stamp.tag()>:c<cycle>``, i.e.
+    ``airflow:<run digest>:<task digest>:m<map index>:c<cycle>``.
     """
     return f"{stamp.tag()}:c{cycle}"
 
@@ -100,7 +103,9 @@ def attempt_tag(stamp: RunStamp, cycle: int) -> str:
 def _owned_cycle(tag: str | None, stamp_tag: str) -> tuple[bool, int | None]:
     """
     Whether ``tag`` marks an attempt of the task whose stamp tag is
-    ``stamp_tag`` (exactly the stamp tag, or it followed by ``:c<digits>``),
+    ``stamp_tag`` (exactly the stamp tag, or it followed by ``:c<digits>``;
+    the stamp tag ends in its own ``:m<map index>``, so ``...:m1`` never
+    owns ``...:m12``),
     and the attempt's clear cycle (``None`` if not recorded).
     """
     if tag is None:
@@ -619,7 +624,10 @@ class YellowDogHook(BaseHook):
         return SubmitResult(wr_id, use, "submitted")
 
     def find_unfinished_run_work_requirements(
-        self, namespace: str | None, run_tag_prefix: str
+        self,
+        namespace: str | None,
+        run_tag_prefix: str,
+        task_tag_prefixes: Collection[str] | None = None,
     ) -> list[str]:
         """
         Return the IDs of the unfinished work requirements whose tag starts
@@ -628,16 +636,48 @@ class YellowDogHook(BaseHook):
         i.e. those submitted by any task of one DAG run, in a namespace or in
         every namespace visible to the credentials. Names are never matched.
 
+        With ``task_tag_prefixes``, only the work requirements whose tag is
+        one of the prefixes or starts with ``<prefix>:`` for one of them are
+        returned. Each prefix is either a task's
+        ``airflow:<run digest>:<task digest>`` (see
+        :meth:`~yellowdog_provider.utils.run_stamp.RunStamp.task_tag_prefix`),
+        for the work requirements of that task at every map index, or a task
+        instance's ``airflow:<run digest>:<task digest>:m<map index>`` (see
+        :meth:`~yellowdog_provider.utils.run_stamp.RunStamp.tag`), for those
+        of that map index only (``m1`` does not match ``m12``).
+
         :param namespace: the namespace to search, or ``None`` for all
         :param run_tag_prefix: the DAG run's tag prefix
+        :param task_tag_prefixes: restrict to these tasks of the run, or
+            ``None`` for the whole run; an empty collection returns ``[]``
+            without searching
         :raises .YellowDogArgumentError: if ``run_tag_prefix`` is not in the
-            ``run_tag_prefix()`` format (so it can never match other runs)
+            ``run_tag_prefix()`` format (so it can never match other runs), or
+            a task prefix is not in one of those two formats or is not in the
+            run
         """
         if not RUN_TAG_PREFIX_PATTERN.fullmatch(run_tag_prefix):
             raise YellowDogArgumentError(
                 f"'{run_tag_prefix}' is not a DAG run tag prefix "
                 "(see RunStamp.run_tag_prefix())"
             )
+        starts = (run_tag_prefix + ":",)
+        exact: frozenset[str] | None = None
+        if task_tag_prefixes is not None:
+            for task_prefix in task_tag_prefixes:
+                valid = TASK_TAG_PREFIX_PATTERN.fullmatch(
+                    task_prefix
+                ) or INSTANCE_TAG_PREFIX_PATTERN.fullmatch(task_prefix)
+                if not valid or not task_prefix.startswith(run_tag_prefix + ":"):
+                    raise YellowDogArgumentError(
+                        f"'{task_prefix}' is not a task tag prefix of the DAG "
+                        f"run '{run_tag_prefix}' (see RunStamp.task_tag_prefix() "
+                        "and RunStamp.tag())"
+                    )
+            if not task_tag_prefixes:
+                return []
+            starts = tuple(p + ":" for p in task_tag_prefixes)
+            exact = frozenset(task_tag_prefixes)
         search = WorkRequirementSearch(
             namespaces=None if namespace is None else [namespace],
             statuses=list(_UNFINISHED_WORK_REQUIREMENT_STATUSES),
@@ -647,7 +687,10 @@ class YellowDogHook(BaseHook):
             summary.id
             for summary in summaries.list_all()
             if summary.id is not None
-            and (summary.tag or "").startswith(run_tag_prefix + ":")
+            and (
+                (summary.tag or "").startswith(starts)
+                or (exact is not None and summary.tag in exact)
+            )
             and summary.status is not None
             and not summary.status.finished
         ]

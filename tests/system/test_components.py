@@ -22,7 +22,7 @@ from datetime import timedelta
 from typing import Any, cast
 
 import pytest
-from airflow.sdk import Context
+from airflow.sdk import DAG, Context
 from yellowdog_client.model import (
     AutoShutdown,
     ComputeRequirementStatus,
@@ -42,7 +42,7 @@ from yellowdog_client.model import (
 from yellowdog_client.model.exceptions import InvalidRequestException
 from yellowdog_client.platform_client import PlatformClient
 
-from tests.support import make_context, render
+from tests.support import NoOp, make_context, render
 from tests.system.config import SystemTestConfig, task_arguments_or_skip
 from yellowdog_provider.exceptions.yellowdog_exceptions import (
     WaitTimeoutError,
@@ -772,7 +772,7 @@ def test_provision_wait_until_ready_and_shutdown_wait(
     cr_id = cast(str, fetched.computeRequirementId)
 
     pushed: dict[str, Any] = {}
-    # A DAG run with no work requirements: the run-scoped cancel finds none
+    # A DAG run with no work requirements: the whole-run cancel finds none
     ctx = _run_context(
         run_tag, sweep_run_tag_prefixes, "shutdown", task_id="shutdown", pushed=pushed
     )
@@ -786,6 +786,7 @@ def test_provision_wait_until_ready_and_shutdown_wait(
             poke_interval=cfg.poke_interval_seconds,
             timeout=cfg.sensor_timeout_seconds,
             deferrable=False,
+            cancel_work_requirements="run",
         ),
         ctx,
     )
@@ -805,9 +806,14 @@ def test_teardown_cancels_only_this_runs_work_requirements(
     sweep_run_tag_prefixes: list[str],
 ) -> None:
     """
-    The teardown (``cancel_run_work_requirements``) cancels the unfinished
-    work requirements of its own DAG run only. The pool is already shut down
-    by the previous test, which the teardown tolerates (as on a retry).
+    The teardown with ``cancel_work_requirements="run"`` cancels the
+    unfinished work requirements of its own DAG run only. The pool is already
+    shut down by the previous test, which the teardown tolerates (as on a
+    retry).
+
+    Depends on order: run it after
+    ``test_provision_wait_until_ready_and_shutdown_wait``. Run alone, it shuts
+    the shared pool down itself.
     """
     cfg = system_config
     groups = _one_task_group(cfg, _no_worker_tag(run_tag), cfg.task_arguments)
@@ -838,7 +844,7 @@ def test_teardown_cancels_only_this_runs_work_requirements(
                         task_id="teardown",
                         connection_id=CONN_ID,
                         worker_pool_id=pool.id,
-                        cancel_run_work_requirements=True,
+                        cancel_work_requirements="run",
                     ),
                     teardown_ctx,
                 )
@@ -846,6 +852,65 @@ def test_teardown_cancels_only_this_runs_work_requirements(
                 status = _fetch_wr(yd_client, theirs).status
                 assert status is not None and not status.finished
                 assert status not in WR_CANCELLED
+
+
+def test_shutdown_cancels_own_scope_only(
+    pool: Pool,
+    system_config: SystemTestConfig,
+    yd_client: PlatformClient,
+    yd_connection_env: str,
+    run_tag: str,
+    sweep_run_tag_prefixes: list[str],
+) -> None:
+    """
+    In a DAG with two parallel setup/teardown scopes, s1 >> w1 >> t1 and
+    s2 >> w2 >> t2, the teardown t1 (``cancel_work_requirements="scope"``,
+    the default) cancels the unfinished work requirement of w1 only, not that
+    of w2 in the same DAG run. The pool is already shut down, which the
+    teardown tolerates.
+
+    Depends on order: run it after
+    ``test_provision_wait_until_ready_and_shutdown_wait``. Run alone, it shuts
+    the shared pool down itself.
+    """
+    cfg = system_config
+    with DAG(DAG_ID, schedule=None):
+        s1, w1, s2, w2 = (NoOp(task_id=i) for i in ("s1", "w1", "s2", "w2"))
+        t1 = ShutdownProvisionedWorkerPool(
+            task_id="t1", connection_id=CONN_ID, worker_pool_id=pool.id
+        )
+        t2 = ShutdownProvisionedWorkerPool(
+            task_id="t2", connection_id=CONN_ID, worker_pool_id=pool.id
+        )
+        _ = s1 >> w1 >> t1.as_teardown(setups=s1)
+        _ = s2 >> w2 >> t2.as_teardown(setups=s2)
+
+    groups = _one_task_group(cfg, _no_worker_tag(run_tag), cfg.task_arguments)
+    prefixes = sweep_run_tag_prefixes
+
+    def submit(task_id: str) -> str:
+        """Submit a work requirement stamped as ``task_id`` of this run."""
+        ctx = _run_context(run_tag, prefixes, "scope", task_id=task_id)
+        with YellowDogHook(connection_id=yd_connection_env) as hook:
+            return hook.submit_work_requirement(
+                WorkRequirement(
+                    namespace=cfg.namespace, name=f"{run_tag}-scope-{task_id}"
+                ),
+                groups,
+                stamp=RunStamp.from_context(ctx),
+                try_number=1,
+                cycle=0,
+            ).work_requirement_id
+
+    in_scope = submit("w1")
+    with _cancelling(in_scope):
+        out_of_scope = submit("w2")
+        with _cancelling(out_of_scope):
+            _execute(t1, _run_context(run_tag, prefixes, "scope", task_id="t1"))
+            assert _fetch_wr(yd_client, in_scope).status in WR_CANCELLED
+            status = _fetch_wr(yd_client, out_of_scope).status
+            assert status is not None and not status.finished
+            assert status not in WR_CANCELLED
 
 
 def test_shutdown_terminate_and_sensors(

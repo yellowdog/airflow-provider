@@ -141,8 +141,9 @@ What changes compared with the three-task shape
 
 **Clean-up is the teardown's job.** A sensor only watches: if
 ``wait-for-work`` times out or is killed, the work requirement keeps running
-until the teardown cancels it (the teardown cancels all of the DAG run's
-unfinished work requirements by default; see :ref:`teardown-cancellation`).
+until the teardown cancels it (by default the teardown cancels the
+unfinished work requirements of every task in its setup/teardown scope,
+which here is every other task of the DAG; see :ref:`teardown-cancellation`).
 Likewise, if ``wait-for-pool`` fails, ``provision-pool`` has already
 succeeded, so the teardown shuts the pool down. ``AddWorkRequirement`` and
 ``AddPopulatedWorkRequirement`` cancel their work requirement only if they

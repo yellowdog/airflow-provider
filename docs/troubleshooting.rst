@@ -149,13 +149,31 @@ Common problems
      - Nothing, unless the wait then fails; check connectivity to the
        Platform API URL.
    * - Work requirements cancelled by the teardown (``Cancelling N
-       unfinished work requirement(s) of this DAG run``)
-     - ``ShutdownProvisionedWorkerPool`` cancels the run's unfinished work
-       requirements before shutting the pool down
-       (``cancel_run_work_requirements=True``, the default).
+       unfinished work requirement(s) of this teardown's scope``)
+     - ``ShutdownProvisionedWorkerPool`` cancels the unfinished work
+       requirements of the tasks in its setup/teardown scope before shutting
+       the pool down (``cancel_work_requirements="scope"``, the default;
+       ``"run"`` cancels the whole DAG run's).
      - Expected if the work was still running when the teardown started,
        for example after a failure elsewhere. To keep it, pass
-       ``cancel_run_work_requirements=False``.
+       ``cancel_work_requirements="none"``; see
+       :ref:`teardown-cancellation`.
+   * - Teardown warns ``... has no setup/teardown scope; no work
+       requirements cancelled``
+     - ``ShutdownProvisionedWorkerPool`` with
+       ``cancel_work_requirements="scope"`` (the default) is not a teardown,
+       or is a teardown with no setups, so it has no scope to cancel.
+     - Make it a teardown of the pool's setup
+       (``.as_teardown(setups=provision)``), or pass
+       ``cancel_work_requirements="run"`` to cancel the whole DAG run's
+       unfinished work requirements.
+   * - Work left running after a worker crash, by a task outside every
+       setup/teardown scope
+     - Under ``"scope"``, a teardown cancels only its own scope's work, so
+       a task in no scope (for example a ``RunWorkRequirement`` on an
+       existing pool) is not cleaned up by any teardown.
+     - Put the task in a teardown's scope, or use
+       ``cancel_work_requirements="run"`` on a teardown that runs after it.
    * - Work of **another Airflow environment** cancelled, resumed or treated
        as already completed
      - Two Airflow environments use the same YellowDog account without

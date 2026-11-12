@@ -159,8 +159,9 @@ def yd_provider_test():
     )
 
     # Teardown: always runs once the work is done, however it ended. It also
-    # cancels the run's unfinished work requirements, and waits for the pool
-    # and its compute requirement to terminate.
+    # cancels the unfinished work requirements of the tasks in its scope (the
+    # setup and the two work tasks), and waits for the pool and its compute
+    # requirement to terminate.
     shut_down_worker_pool = ShutdownProvisionedWorkerPool(
         task_id="shutdown-worker-pool",
         connection_id="{{ params.connection_id }}",

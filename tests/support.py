@@ -6,6 +6,13 @@ import jinja2.sandbox
 from airflow.sdk import BaseOperator, Context
 
 
+class NoOp(BaseOperator):
+    """An operator that does nothing (a stand-in task in test DAGs)."""
+
+    def execute(self, context: Context) -> None:
+        """Do nothing."""
+
+
 def render(op: BaseOperator, context: Context) -> None:
     """Render the operator's templated fields in place."""
     op.render_template_fields(context, jinja2.sandbox.SandboxedEnvironment())

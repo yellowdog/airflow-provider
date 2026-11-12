@@ -29,12 +29,23 @@ from yellowdog_provider.exceptions.yellowdog_exceptions import (
     YellowDogArgumentError,
     YellowDogException,
 )
-from yellowdog_provider.hooks.yellowdog_hooks import SubmitResult, YellowDogHook
-from yellowdog_provider.utils.run_stamp import RunStamp, derive_name, try_name
+from yellowdog_provider.hooks.yellowdog_hooks import (
+    SubmitResult,
+    YellowDogHook,
+    _owned_cycle,
+)
+from yellowdog_provider.utils.run_stamp import (
+    RunStamp,
+    derive_name,
+    task_tag_prefix_for,
+    try_name,
+)
 
 NS = "ns"
 STAMP = RunStamp("dag", "run-1", "task", -1)
 OTHER = RunStamp("dag", "run-0", "task", -1)
+MAPPED_1 = RunStamp("dag", "run-1", "task", 1)
+MAPPED_12 = RunStamp("dag", "run-1", "task", 12)
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
@@ -450,6 +461,13 @@ def test_submit_owns_cycle_suffixed_tags_only_for_same_stamp(
         platform.work.cancel_work_requirement_by_id.assert_not_called()
 
 
+def test_owned_cycle_never_confuses_map_index_prefixes() -> None:
+    assert _owned_cycle(f"{MAPPED_1.tag()}:c3", MAPPED_1.tag()) == (True, 3)
+    assert _owned_cycle(MAPPED_1.tag(), MAPPED_1.tag()) == (True, None)
+    assert _owned_cycle(f"{MAPPED_12.tag()}:c3", MAPPED_1.tag()) == (False, None)
+    assert _owned_cycle(MAPPED_12.tag(), MAPPED_1.tag()) == (False, None)
+
+
 def test_submit_rejects_negative_cycle(platform: FakePlatform) -> None:
     with pytest.raises(YellowDogArgumentError):
         _submit(cycle=-1)
@@ -706,6 +724,89 @@ def test_find_unfinished_run_work_requirements_rejects_non_run_prefix(
     platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
     with pytest.raises(YellowDogArgumentError):
         YellowDogHook("yd_test").find_unfinished_run_work_requirements(NS, prefix)
+    platform.work.get_work_requirements.assert_not_called()
+
+
+def test_find_unfinished_run_work_requirements_scoped_to_task_prefixes(
+    platform: FakePlatform,
+) -> None:
+    other_task = RunStamp("dag", "run-1", "other-task", -1)
+    third_task = RunStamp("dag", "run-1", "third", -1)
+    mapped = [RunStamp("dag", "run-1", "mapped", i) for i in (1, 12)]
+    a = platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
+    b = platform.existing("b", other_task, WorkRequirementStatus.HELD, cycle=7)
+    m = [
+        platform.existing(f"m{s.map_index}", s, WorkRequirementStatus.RUNNING)
+        for s in mapped
+    ]
+    platform.existing("c", third_task, WorkRequirementStatus.RUNNING)
+    platform.existing("d", STAMP, WorkRequirementStatus.COMPLETED)
+    platform.existing("e", OTHER, WorkRequirementStatus.RUNNING)
+    ids = YellowDogHook("yd_test").find_unfinished_run_work_requirements(
+        NS,
+        STAMP.run_tag_prefix(),
+        [
+            STAMP.task_tag_prefix(),
+            other_task.task_tag_prefix(),
+            mapped[0].task_tag_prefix(),
+        ],
+    )
+    assert sorted(ids) == sorted([str(a.id), str(b.id), *(str(w.id) for w in m)])
+    assert task_tag_prefix_for(STAMP, "other-task") == other_task.task_tag_prefix()
+
+
+def test_find_unfinished_run_work_requirements_scoped_to_map_index(
+    platform: FakePlatform,
+) -> None:
+    one = platform.existing("m1", MAPPED_1, WorkRequirementStatus.RUNNING, cycle=2)
+    one_legacy = platform.existing(
+        "m1-legacy", MAPPED_1, WorkRequirementStatus.HELD, cycle=None
+    )
+    twelve = platform.existing("m12", MAPPED_12, WorkRequirementStatus.RUNNING)
+    unmapped = platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
+    other_task = RunStamp("dag", "run-1", "other-task", -1)
+    b = platform.existing("b", other_task, WorkRequirementStatus.RUNNING)
+    ids = YellowDogHook("yd_test").find_unfinished_run_work_requirements(
+        NS, STAMP.run_tag_prefix(), [MAPPED_1.tag(), other_task.task_tag_prefix()]
+    )
+    # m1 does not match m12; the legacy tag (no cycle) is the prefix itself
+    assert sorted(ids) == sorted([str(one.id), str(one_legacy.id), str(b.id)])
+    assert twelve.status == unmapped.status == WorkRequirementStatus.RUNNING
+
+
+def test_find_unfinished_run_work_requirements_empty_scope_makes_no_call(
+    platform: FakePlatform,
+) -> None:
+    platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
+    assert (
+        YellowDogHook("yd_test").find_unfinished_run_work_requirements(
+            NS, STAMP.run_tag_prefix(), []
+        )
+        == []
+    )
+    platform.work.get_work_requirements.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "airflow:abc",
+        STAMP.run_tag_prefix(),
+        f"{STAMP.task_tag_prefix()}:m",
+        f"{STAMP.task_tag_prefix()}:mx",
+        f"{STAMP.task_tag_prefix()}:m1:",
+        _tag(STAMP, 0),
+        OTHER.task_tag_prefix(),
+        OTHER.tag(),
+    ],
+)
+def test_find_unfinished_run_work_requirements_rejects_bad_task_prefix(
+    platform: FakePlatform, prefix: str
+) -> None:
+    with pytest.raises(YellowDogArgumentError):
+        YellowDogHook("yd_test").find_unfinished_run_work_requirements(
+            NS, STAMP.run_tag_prefix(), [STAMP.task_tag_prefix(), prefix]
+        )
     platform.work.get_work_requirements.assert_not_called()
 
 

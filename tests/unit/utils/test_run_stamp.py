@@ -6,12 +6,15 @@ import pytest
 from tests.support import make_context
 from yellowdog_provider.utils import run_stamp
 from yellowdog_provider.utils.run_stamp import (
+    INSTANCE_TAG_PREFIX_PATTERN,
     MAX_NAME_LENGTH,
     NAME_PATTERN,
     RUN_TAG_PREFIX_PATTERN,
+    TASK_TAG_PREFIX_PATTERN,
     RunStamp,
     derive_name,
     sanitise_name,
+    task_tag_prefix_for,
     try_name,
 )
 
@@ -182,7 +185,8 @@ def test_empty_deployment_id_leaves_stamp_unchanged() -> None:
 
     stamp = _stamp()
     assert stamp.run_tag_prefix() == f"airflow:{digest('d', 'r')}"
-    assert stamp.tag() == f"airflow:{digest('d', 'r')}:{digest('t', -1)}"
+    assert stamp.task_tag_prefix() == f"airflow:{digest('d', 'r')}:{digest('t')}"
+    assert stamp.tag() == f"airflow:{digest('d', 'r')}:{digest('t')}:m-1"
     assert _stamp(deployment_id="").tag() == stamp.tag()
 
 
@@ -202,3 +206,40 @@ def test_from_context_reads_deployment_id() -> None:
     assert stamp.deployment_id == "prod"
     with patch.object(run_stamp.conf, "get", return_value=""):
         assert RunStamp.from_context(make_context()).deployment_id == ""
+
+
+def test_tag_format_and_map_index_part() -> None:
+    assert re.fullmatch(r"airflow:[0-9a-f]{12}:[0-9a-f]{12}:m-1", _stamp().tag())
+    assert _stamp(map_index=12).tag().endswith(":m12")
+    assert TASK_TAG_PREFIX_PATTERN.fullmatch(_stamp().task_tag_prefix())
+    assert not TASK_TAG_PREFIX_PATTERN.fullmatch(_stamp().tag())
+    assert not TASK_TAG_PREFIX_PATTERN.fullmatch(_stamp().run_tag_prefix())
+
+
+def test_instance_tag_prefix_pattern() -> None:
+    for map_index in (-1, 0, 12):
+        assert INSTANCE_TAG_PREFIX_PATTERN.fullmatch(_stamp(map_index=map_index).tag())
+    task = _stamp().task_tag_prefix()
+    for bad in (task, f"{task}:m", f"{task}:mx", f"{task}:m1:c0", f"{task}:1"):
+        assert not INSTANCE_TAG_PREFIX_PATTERN.fullmatch(bad), bad
+
+
+def test_task_tag_prefix_shared_by_map_indices_not_task_ids() -> None:
+    assert (
+        _stamp(map_index=0).task_tag_prefix() == _stamp(map_index=1).task_tag_prefix()
+    )
+    assert _stamp(map_index=0).tag() != _stamp(map_index=1).tag()
+    assert _stamp().task_tag_prefix() != _stamp(task_id="t2").task_tag_prefix()
+    assert _stamp().tag().startswith(_stamp().task_tag_prefix() + ":")
+
+
+def test_deployment_id_changes_task_tag_prefix() -> None:
+    assert _stamp().task_tag_prefix() != _stamp(deployment_id="a").task_tag_prefix()
+
+
+def test_task_tag_prefix_for_other_task() -> None:
+    stamp = _stamp(map_index=3, deployment_id="dep")
+    assert (
+        task_tag_prefix_for(stamp, "other")
+        == _stamp(task_id="other", deployment_id="dep").task_tag_prefix()
+    )

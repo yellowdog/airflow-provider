@@ -17,8 +17,8 @@ them together:
   submits a work requirement with its task groups and tasks, and waits until
   it completes. It fails if the work fails or is cancelled.
 - :class:`~yellowdog_provider.operators.yellowdog_operators.ShutdownProvisionedWorkerPool`
-  cancels any of the DAG run's work that is still running, then shuts the
-  pool down.
+  cancels any work of its setup/teardown scope that is still running, then
+  shuts the pool down.
 
 No sensors are needed: each operator waits for its own resource. This page
 explains what the three operators do for you: deferral, cancellation,
@@ -332,35 +332,75 @@ also cancel their work requirement (with abort) if killed while running.
 
 .. _teardown-cancellation:
 
-The teardown cancels the run's work
------------------------------------
+The teardown cancels its scope's work
+-------------------------------------
 
 Before it shuts the pool down, ``ShutdownProvisionedWorkerPool`` cancels, with
-abort, **every unfinished work requirement that this DAG run submitted**,
-from any task, in every namespace that the connection's credentials can see.
-This is the backstop for the cases above where nothing else cleans up: a
-deferred task killed on Airflow 3.1 or 3.2, a crashed worker, or a task
+abort, the **unfinished work requirements submitted by the tasks in its
+setup/teardown scope**, in every namespace that the connection's credentials
+can see. This is the backstop for the cases above where nothing else cleans
+up: a deferred task killed on Airflow 3.1 or 3.2, a crashed worker, or a task
 killed in the moment between creating its work requirement and recording its
 ID (an error while the work requirement is being submitted cancels the partly
 built work requirement, so the kill is the only gap).
 
+The teardown's *scope* is:
+
+- its setups: its direct upstream tasks that are setups (``as_setup()``, or
+  ``as_teardown(setups=...)``);
+- every task that is both downstream of one of those setups and upstream of
+  the teardown.
+
+The teardown itself is not in its scope. A mapped task is covered by its
+task ID, so the work requirements of all its map indices are cancelled. Task
+IDs inside an Airflow ``TaskGroup`` are the fully qualified ones
+(``group.task``).
+
+Inside a **mapped task group** (``@task_group`` with ``.expand(...)``), each
+teardown instance covers only its own map instance of the tasks in that
+group: Airflow runs a group instance's teardown once that instance's tasks
+are done, while other instances may still be running, so teardown ``[0]``
+cancels the work of ``grp.w[0]`` but not of ``grp.w[1]``. Scope tasks outside
+the group (for example a setup before it), and tasks in a mapped group nested
+inside it, are still covered at every map index. For example, with ``s1 >> w1 >> t1.as_teardown(setups=s1)``
+and ``s2 >> w2 >> t2.as_teardown(setups=s2)`` in the same DAG, ``t1``
+cancels only the work of ``s1`` and ``w1``, and ``t2`` only that of ``s2``
+and ``w2``, so two pools (for example a CPU pool and a GPU pool) can run
+side by side in one DAG run. A task in two overlapping scopes is cancelled
+by whichever teardown runs first.
+
+``cancel_work_requirements`` chooses what is cancelled:
+
+- ``"scope"`` (the default): the work requirements of the tasks in this
+  teardown's scope, as above.
+- ``"run"``: every unfinished work requirement that **this DAG run**
+  submitted, from any task. Use it when a single teardown should clean up
+  the whole run, and nothing else runs in parallel that it must not abort.
+- ``"none"``: nothing is cancelled.
+
+Any other value raises ``YellowDogArgumentError`` when the DAG is parsed.
+
+.. note::
+
+   Under ``"scope"``, a task that is in no teardown's scope, for example a
+   ``RunWorkRequirement`` on an existing pool in a parallel branch, is not
+   cleaned up by any teardown. It still cancels its own work requirement on
+   failure, timeout or kill; what is lost is the clean-up after a crashed
+   worker (or one of the other gaps above). To have a teardown cover such
+   tasks, put them in its scope or use ``cancel_work_requirements="run"``.
+
 .. warning::
 
-   The cancellation covers the **whole DAG run**, not just the work of the
-   pool being shut down: the first teardown to run aborts every unfinished
-   work requirement the run submitted, from any task. Set
-   ``cancel_run_work_requirements=False`` when other pool scopes or other
-   work run concurrently in the same DAG run, for example a CPU pool and a
-   GPU pool each with their own setup and teardown, or a
-   ``RunWorkRequirement`` on an existing pool in a parallel branch.
-   Otherwise the first teardown aborts the other branch's work.
+   Under ``"scope"``, an operator that is not a teardown
+   (``as_teardown(...)``), or a teardown with no setups, has no scope: it
+   cancels nothing, logs a warning saying so, and still shuts the pool down.
+   Use ``"run"`` if it should cancel the run's work.
 
-- The run's work requirements are recognised by the run stamp in their
-  ``tag`` (below). Work requirements of other DAG runs, or not submitted by
-  the provider, are never touched, even if they have similar names.
-- It is on by default (``cancel_run_work_requirements=True``). Pass
-  ``cancel_run_work_requirements=False`` to leave the run's work alone (see
-  the warning above).
+- The work requirements are recognised by the run stamp in their ``tag``
+  (below): the run tag prefix and, under ``"scope"``, the task tag prefix of
+  each task in the scope (with the map index, inside a mapped task group).
+  Work requirements of other DAG runs, or not submitted by the provider, are
+  never touched, even if they have similar names.
 - It is best-effort: a failure to look up or cancel is logged, and the
   shutdown goes ahead. Nothing is cancelled if the pool is rejected (not a
   provisioned pool).
@@ -390,17 +430,22 @@ The run stamp
 
 The work requirement's ``tag`` is set to::
 
-   airflow:<run digest>:<task digest>:c<cycle>
+   airflow:<run digest>:<task digest>:m<map index>:c<cycle>
 
-for example ``airflow:9e93c7577e68:d3a517bdc1f2:c0``, where:
+for example ``airflow:9e93c7577e68:d3a517bdc1f2:m-1:c0``, where:
 
 - ``<run digest>`` (12 hex characters) identifies the DAG run: a digest of the
   DAG ID and run ID (and the :ref:`deployment ID <deployment-id>`, if set).
-  ``airflow:<run digest>`` is the *run tag prefix* that the teardown searches
-  for.
+  ``airflow:<run digest>`` is the *run tag prefix*, which the teardown
+  searches for with ``cancel_work_requirements="run"``.
 - ``<task digest>`` (12 hex characters) identifies the task within the run: a
-  digest of the task ID and map index (and the deployment ID, if set), so
-  each mapped task instance has its own stamp. For a mapped
+  digest of the task ID (and the deployment ID, if set), shared by every map
+  index of a mapped task. ``airflow:<run digest>:<task digest>`` is the
+  *task tag prefix*; the teardown searches for those of the tasks in its
+  scope (the default, ``"scope"``).
+- ``<map index>`` is the task instance's map index, ``-1`` if not mapped.
+  With it, the tag identifies each task instance, so map indices never take
+  over each other's work requirements on a retry. For a mapped
   ``RunWorkRequirement``, leave the work requirement's ``name`` unset: the
   derived names are unique per map index, whereas a fixed name is seen free
   by concurrent map indices, and all but one then fail on the duplicate.

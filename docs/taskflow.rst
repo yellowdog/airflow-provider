@@ -42,10 +42,13 @@ afterwards. All methods raise the SDK's errors unchanged, except where noted.
    * - ``cancel_work_requirement(work_requirement_id, *, abort)``
      - Cancel a work requirement; ``abort=True`` stops running tasks. A
        work requirement that has already finished is not an error.
-   * - ``find_unfinished_run_work_requirements(namespace, run_tag_prefix)``
+   * - ``find_unfinished_run_work_requirements(namespace, run_tag_prefix, task_tag_prefixes=None)``
      - IDs of the unfinished work requirements submitted by one DAG run, in a
-       namespace or (``None``) in every visible namespace. Used by the
-       teardown.
+       namespace or (``None``) in every visible namespace; with
+       ``task_tag_prefixes``, only those of the given tasks: each prefix is
+       a task's ``airflow:<run>:<task>`` (every map index) or a task
+       instance's ``airflow:<run>:<task>:m<index>`` (that map index only).
+       Used by the teardown.
    * - ``provision_worker_pool(usage, properties)``
      - Provision a worker pool; returns its ID.
    * - ``shutdown_worker_pool(worker_pool_id, *, terminate_immediately)``
@@ -168,12 +171,15 @@ Notes:
   pass the run stamp built from the task's context, Airflow's try number
   (used in ``-try<N>`` names) and the task instance's ``max_tries`` (the
   clear cycle). See :ref:`safe-retries`. The work requirement is tagged with
-  the run stamp, so the teardown's run-scoped cancellation
-  (:ref:`teardown-cancellation`) covers it too.
+  the run stamp, so a teardown's cancellation
+  (:ref:`teardown-cancellation`) covers it too when the task is in that
+  teardown's setup/teardown scope (or with
+  ``cancel_work_requirements="run"``).
 - Unlike the operators, a ``@task`` function has no ``on_kill``, so this
   task does not cancel its work requirement when it is killed (for example
-  marked failed). Use a ``ShutdownProvisionedWorkerPool`` teardown, which
-  cancels the run's unfinished work requirements, as the backstop.
+  marked failed). Use a ``ShutdownProvisionedWorkerPool`` teardown whose
+  scope includes this task, which cancels its unfinished work requirements,
+  as the backstop.
 - This task holds a worker slot while it waits. For long waits, use
   ``RunWorkRequirement`` with ``deferrable=True`` instead.
 

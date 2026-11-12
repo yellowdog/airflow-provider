@@ -220,7 +220,8 @@ resource to reach a state.
        **compute requirement template**, optionally waiting until the pool is
        ready. Returns the worker pool's ID. Typically a setup task.
    * - :class:`~yellowdog_provider.operators.yellowdog_operators.ShutdownProvisionedWorkerPool`
-     - Cancels the DAG run's unfinished work requirements, then shuts down a
+     - Cancels the unfinished work requirements of its setup/teardown scope
+       (or of the whole DAG run), then shuts down a
        provisioned worker pool, optionally terminating its compute
        requirement immediately. Typically a teardown task.
    * - :class:`~yellowdog_provider.sensors.yellowdog_sensors.WorkRequirementStateSensor`
