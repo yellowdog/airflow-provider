@@ -89,4 +89,4 @@ The example DAGs are in [yellowdog_provider/example_dags](yellowdog_provider/exa
 
 ### Releasing
 
-See [RELEASING.md](RELEASING.md). Releases are made from `main` with `make release` (`bin/release.py`).
+See [RELEASING.md](RELEASING.md). Releases are made from `next-version` with `make release` (`bin/release.py`), which also updates `main` and starts the next development version.

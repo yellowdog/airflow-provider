@@ -1,6 +1,7 @@
 """Tests for bin/release.py. No network access; the only real subprocesses are
 the Python interpreter (to test the default runner)."""
 
+import datetime
 import importlib.util
 import subprocess
 import sys
@@ -21,14 +22,17 @@ _SPEC.loader.exec_module(release)
 class FakeRunner:
     def __init__(
         self,
-        branch: str = "main",
+        branch: str = "next-version",
         head: str = "abc",
         origin: str = "abc",
         porcelain: str = "",
         fail_on: str | None = None,
         tags: str = "",
         error: BaseException | None = None,
+        diverged: bool = False,
+        local_main: bool = True,
     ) -> None:
+        self.diverged, self.local_main = diverged, local_main
         self.branch, self.head, self.origin = branch, head, origin
         self.porcelain, self.fail_on, self.tags = porcelain, fail_on, tags
         self.error = error
@@ -45,8 +49,14 @@ class FakeRunner:
             return self.branch + "\n"
         if text == "git rev-parse HEAD":
             return self.head + "\n"
-        if text == "git rev-parse origin/main":
+        if text == f"git rev-parse origin/{self.branch}":
             return self.origin + "\n"
+        if text.startswith("git merge-base --is-ancestor"):
+            if self.diverged:
+                raise subprocess.CalledProcessError(1, cmd, "", "")
+            return ""
+        if text == "git branch --list main":
+            return "  main\n" if self.local_main else ""
         if text.startswith("git status --porcelain"):
             return self.porcelain
         if text.startswith("git tag -l") or text.startswith("git ls-remote"):
@@ -111,7 +121,7 @@ def test_git_state_ok() -> None:
 
 def test_git_state_wrong_branch() -> None:
     with pytest.raises(release.ReleaseError, match="branch"):
-        release.check_git_state(FakeRunner(branch="next-version"))
+        release.check_git_state(FakeRunner(branch="main"))
 
 
 def test_git_state_behind_origin() -> None:
@@ -219,8 +229,9 @@ def test_upload_failure_deletes_tag(
     assert release.main(["--yes"], run=run, root=root) == 1
     joined = run.joined()
     assert "git tag -d v2.0.0" in joined
-    assert not any("push" in c for c in joined)
+    assert "git push origin v2.0.0" not in joined
     assert "make docs-publish-image" not in joined
+    assert not any("chore: start" in c for c in joined)
 
 
 def test_test_pypi_skips_tag_push_and_docs(
@@ -268,12 +279,16 @@ def _release(
     return release.main(["--yes"] if argv is None else argv, run=run, root=root)
 
 
-def test_main_rejects_dev_version(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("version", ["2.0.0rc1", "2.0", "2.0.0+local"])
+def test_main_rejects_unreleasable_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    version: str,
 ) -> None:
     run = FakeRunner()
-    assert _release(tmp_path, monkeypatch, run, version="2.0.0.dev0") == 1
-    assert "dev/pre-release" in capsys.readouterr().err
+    assert _release(tmp_path, monkeypatch, run, version=version) == 1
+    assert "Cannot release" in capsys.readouterr().err
     assert "make check" not in run.joined()
 
 
@@ -281,12 +296,17 @@ def test_main_requires_changelog_heading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = _write_project(tmp_path)
-    (root / "docs" / "changelog.rst").write_text("2.0.0 (unreleased)\n------\n")
+    (root / "docs" / "changelog.rst").write_text("1.0.4 (2025-01-01)\n------\n")
     _patch_pypi(monkeypatch)
     run = FakeRunner()
     assert release.main(["--yes"], run=run, root=root) == 1
-    assert "2.0.0 (YYYY-MM-DD)" in capsys.readouterr().err
-    assert "make check" not in run.joined()
+    assert "2.0.0 (unreleased)" in capsys.readouterr().err
+    joined = run.joined()
+    assert not any("twine" in c or "commit" in c or "push" in c for c in joined)
+    assert (
+        joined[-1]
+        == "git checkout -- yellowdog_provider/__init__.py docs/changelog.rst"
+    )
 
 
 def test_main_check_failure_stops_before_build(
@@ -352,7 +372,7 @@ def test_upload_interrupted_deletes_tag(
         assert _release(tmp_path, monkeypatch, run) == 1
     joined = run.joined()
     assert joined[-1] == "git tag -d v2.0.0"
-    assert not any("push" in c for c in joined)
+    assert "git push origin v2.0.0" not in joined
 
 
 def test_upload_failure_message_includes_stderr(
@@ -367,10 +387,11 @@ def test_upload_failure_message_includes_stderr(
 def test_push_failure_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run = FakeRunner(fail_on="git push")
+    run = FakeRunner(fail_on="git push origin v2.0.0")
     assert _release(tmp_path, monkeypatch, run) == 1
     err = capsys.readouterr().err
     assert "Pushing tag v2.0.0 failed" in err
+    assert "start 2.0.1.dev0" in err
     assert "already published" in err
     assert "git push origin v2.0.0" in err
     assert "make docs-publish-image" in err
@@ -476,7 +497,9 @@ def test_tag_interrupt_cleanup_is_local_and_best_effort(
             if text.startswith("git tag -a"):
                 self.commands.append(cmd)
                 raise KeyboardInterrupt
-            if text.startswith("git tag -l") and len(self.commands) > 6:
+            if text.startswith("git tag -l") and any(
+                c[:3] == ["git", "tag", "-a"] for c in self.commands
+            ):
                 self.commands.append(cmd)
                 raise subprocess.CalledProcessError(1, cmd, "", "boom")
             return super().__call__(cmd)
@@ -487,3 +510,257 @@ def test_tag_interrupt_cleanup_is_local_and_best_effort(
     joined = run.joined()
     assert joined[-1] == "git tag -l v2.0.0"
     assert not any("ls-remote" in c for c in joined[joined.index("make clean build") :])
+
+
+# --- Full process from next-version: version, changelog, branches, dev bump ---
+
+CHANGELOG_DEV = """Changelog
+=========
+
+2.0.0 (unreleased)
+------------------
+
+- new
+
+1.0.4 (2025-01-01)
+------------------
+
+- old
+"""
+TODAY = datetime.date(2026, 11, 12)
+RESTORE = "git checkout -- yellowdog_provider/__init__.py docs/changelog.rst"
+RELEASE_COMMIT = (
+    "git commit -m release: 2.0.0 -- yellowdog_provider/__init__.py docs/changelog.rst"
+)
+
+
+def _write_dev_project(tmp_path: Path, version: str = "2.0.0.dev0") -> Path:
+    pkg = tmp_path / "yellowdog_provider"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(f'"""doc"""\n\n__version__ = "{version}"\n')
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "changelog.rst").write_text(CHANGELOG_DEV)
+    return tmp_path
+
+
+def _run_dev(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run: FakeRunner,
+    argv: list[str] | None = None,
+) -> tuple[int, Path]:
+    root = _write_dev_project(tmp_path)
+    _patch_pypi(monkeypatch)
+    code = release.main(
+        ["--yes"] if argv is None else argv, run=run, root=root, today=lambda: TODAY
+    )
+    return code, root
+
+
+def test_release_version_and_next_dev_version() -> None:
+    assert release.release_version("2.0.0.dev0", None) == "2.0.0"
+    assert release.release_version("2.0.0.dev3", None) == "2.0.0"
+    assert release.release_version("2.0.0", None) == "2.0.0"  # a re-run
+    assert release.release_version("2.0.0.dev0", "2.1.0") == "2.1.0"
+    for bad in ("2.0.0rc1", "2.0", "2.0.0+local"):
+        with pytest.raises(release.ReleaseError):
+            release.release_version(bad, None)
+    assert release.next_dev_version("2.0.0", None) == "2.0.1.dev0"
+    assert release.next_dev_version("2.0.0", "2.1.0") == "2.1.0.dev0"
+    with pytest.raises(release.ReleaseError):
+        release.next_dev_version("2.0.0", "2.1")
+
+
+def test_date_changelog(tmp_path: Path) -> None:
+    changelog = tmp_path / "changelog.rst"
+    changelog.write_text(CHANGELOG_DEV)
+    assert release.date_changelog(changelog, "2.0.0", "2026-11-12")
+    text = changelog.read_text()
+    assert "2.0.0 (2026-11-12)\n------------------\n\n- new" in text
+    assert "unreleased" not in text
+    assert not release.date_changelog(changelog, "2.0.0", "2026-11-13")  # re-run
+    assert changelog.read_text() == text
+    with pytest.raises(release.ReleaseError, match=r"2\.1\.0 \(unreleased\)"):
+        release.date_changelog(changelog, "2.1.0", "2026-11-12")
+
+
+def test_add_changelog_heading(tmp_path: Path) -> None:
+    changelog = tmp_path / "changelog.rst"
+    changelog.write_text(CHANGELOG_DEV)
+    release.add_changelog_heading(changelog, "2.0.1")
+    assert changelog.read_text().startswith(
+        "Changelog\n=========\n\n2.0.1 (unreleased)\n------------------\n\n"
+        "2.0.0 (unreleased)\n"
+    )
+
+
+def test_write_version(tmp_path: Path) -> None:
+    init = tmp_path / "__init__.py"
+    init.write_text('"""doc"""\n__version__ = "2.0.0.dev0"\nx = "__version__"\n')
+    release.write_version(init, "2.0.0")
+    assert init.read_text() == '"""doc"""\n__version__ = "2.0.0"\nx = "__version__"\n'
+
+
+def test_full_process_from_next_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = FakeRunner()
+    code, root = _run_dev(tmp_path, monkeypatch, run)
+    assert code == 0
+    joined = run.joined()
+    steps = [
+        "git merge-base --is-ancestor origin/main HEAD",
+        "git merge-base --is-ancestor main HEAD",
+        "make check",
+        "make clean build",
+        "twine check dist/*",
+        RELEASE_COMMIT,
+        "git push origin next-version",
+        "git push origin HEAD:main",
+        "git branch -f main HEAD",
+        "git tag -a v2.0.0 -m Version 2.0.0",
+        "twine upload --repository yellowdog-airflow-provider dist/*",
+        "git push origin v2.0.0",
+        "make docs-publish-image",
+        "git commit -m chore: start 2.0.1.dev0 -- "
+        "yellowdog_provider/__init__.py docs/changelog.rst",
+    ]
+    idx = [joined.index(s) for s in steps]
+    assert idx == sorted(idx)
+    assert joined[-1] == "git push origin next-version"
+    assert RESTORE not in joined
+    assert release.read_version(root / "yellowdog_provider" / "__init__.py") == (
+        "2.0.1.dev0"
+    )
+    text = (root / "docs" / "changelog.rst").read_text()
+    assert "2.0.1 (unreleased)\n------------------\n\n2.0.0 (2026-11-12)\n" in text
+
+
+def test_next_version_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run = FakeRunner()
+    code, root = _run_dev(
+        tmp_path, monkeypatch, run, ["--yes", "--next-version", "2.1.0"]
+    )
+    assert code == 0
+    assert release.read_version(root / "yellowdog_provider" / "__init__.py") == (
+        "2.1.0.dev0"
+    )
+    assert "2.1.0 (unreleased)" in (root / "docs" / "changelog.rst").read_text()
+
+
+def test_diverged_main_fails_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = FakeRunner(diverged=True)
+    code, _ = _run_dev(tmp_path, monkeypatch, run)
+    assert code == 1
+    assert "cannot be fast-forwarded" in capsys.readouterr().err
+    assert "make check" not in run.joined()
+
+
+def test_no_local_main_is_not_updated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = FakeRunner(local_main=False)
+    code, _ = _run_dev(tmp_path, monkeypatch, run)
+    assert code == 0
+    joined = run.joined()
+    assert "git merge-base --is-ancestor main HEAD" not in joined
+    assert "git branch -f main HEAD" not in joined
+    assert "git push origin HEAD:main" in joined
+
+
+def test_dry_run_restores_files_and_commits_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = FakeRunner()
+    code, _ = _run_dev(tmp_path, monkeypatch, run, ["--dry-run"])
+    assert code == 0
+    joined = run.joined()
+    assert joined[-1] == RESTORE
+    assert not any("commit" in c or "push" in c or "upload" in c for c in joined)
+    out = capsys.readouterr().out
+    assert "git commit -m release: 2.0.0" in out
+    assert "git push origin HEAD:main" in out
+    assert "chore: start 2.0.1.dev0" in out
+
+
+def test_test_pypi_restores_files_and_commits_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = FakeRunner()
+    code, _ = _run_dev(tmp_path, monkeypatch, run, ["--test-pypi", "--yes"])
+    assert code == 0
+    joined = run.joined()
+    assert "twine upload --repository yellowdog-testpypi dist/*" in joined
+    assert joined[-1] == RESTORE
+    assert not any("commit" in c or "push" in c or "tag -a" in c for c in joined)
+
+
+def test_build_failure_restores_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = FakeRunner(fail_on="make clean build")
+    code, _ = _run_dev(tmp_path, monkeypatch, run)
+    assert code == 1
+    joined = run.joined()
+    assert joined[-1] == RESTORE
+    assert not any("commit" in c or "push" in c for c in joined)
+
+
+def test_build_interrupt_restores_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = FakeRunner(fail_on="make clean build", error=KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        _run_dev(tmp_path, monkeypatch, run)
+    assert run.joined()[-1] == RESTORE
+
+
+def test_rerun_after_release_commit_reuses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Version already final and changelog dated: no new release commit
+    root = _write_project(tmp_path)
+    _patch_pypi(monkeypatch)
+    run = FakeRunner()
+    assert release.main(["--yes"], run=run, root=root, today=lambda: TODAY) == 0
+    joined = run.joined()
+    assert not any(c.startswith("git commit -m release") for c in joined)
+    assert "git push origin HEAD:main" in joined
+    assert "git tag -a v2.0.0 -m Version 2.0.0" in joined
+
+
+def test_release_push_failure_after_commit_explains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = FakeRunner(fail_on="git push origin next-version")
+    code, _ = _run_dev(tmp_path, monkeypatch, run)
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "push it with 'git push origin next-version', then re-run" in err
+    joined = run.joined()
+    assert RESTORE not in joined
+    assert not any("tag -a" in c or "upload" in c for c in joined)
+
+
+def test_release_commit_failure_restores_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = FakeRunner(fail_on="git commit -m release")
+    code, _ = _run_dev(tmp_path, monkeypatch, run)
+    assert code == 1
+    assert "Fix the cause and re-run" in capsys.readouterr().err
+    assert run.joined()[-1] == RESTORE
+
+
+def test_dev_bump_failure_explains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = FakeRunner(fail_on="chore: start")
+    code, _ = _run_dev(tmp_path, monkeypatch, run)
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "Version 2.0.0 is released" in err
+    assert "2.0.1.dev0" in err
