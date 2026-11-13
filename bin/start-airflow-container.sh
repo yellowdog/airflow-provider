@@ -22,7 +22,7 @@ docker run --rm -it -p 8080:8080 \
     -v "$(pwd)":/opt/airflow/airflow-provider-yellowdog \
     --name airflow-provider-yellowdog \
     --entrypoint=/bin/bash \
-    apache/airflow:slim-latest-python3.12 \
+    apache/airflow:slim-latest-python3.14 \
     -c "cp -r /opt/airflow/airflow-provider-yellowdog /tmp && \
         pip install -U /tmp/airflow-provider-yellowdog && \
         pip install apache-airflow-providers-fab && \
@@ -44,6 +44,13 @@ docker run --rm -it -p 8080:8080 \
             --conn-password=$YD_VAR_APP_SECRET_YELLOWDOG \
             --conn-description='Production Platform > Account: yellowdog > Application: yd-demo' \
             prod-yellowdog-yd-demo && \
+          airflow connections add \
+            --conn-type=yellowdog \
+            --conn-host='https://api.yellowdog.ai' \
+            --conn-login=$YD_VAR_APP_KEY_YELLOWDOG \
+            --conn-password=$YD_VAR_APP_SECRET_YELLOWDOG \
+            --conn-description='Production Platform > Account: yellowdog > Application: yd-demo' \
+            yellowdog_default && \
           airflow connections add \
             --conn-type=yellowdog \
             --conn-host='https://test.yellowdog.tech/api' \
