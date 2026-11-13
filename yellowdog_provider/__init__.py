@@ -4,6 +4,8 @@ __version__ = "2.0.0.dev0"
 
 
 def get_provider_info() -> dict[str, Any]:
+    from yellowdog_provider.hooks import _connection_ui as ui
+
     return {
         "package-name": "yellowdog-airflow-provider",
         "versions": [__version__],
@@ -11,32 +13,20 @@ def get_provider_info() -> dict[str, Any]:
         "description": "YellowDog provider for Apache Airflow",
         "connection-types": [
             {
-                "connection-type": "yellowdog",
+                "connection-type": ui.CONNECTION_TYPE,
                 "hook-class-name": (
                     "yellowdog_provider.hooks.yellowdog_hooks.YellowDogHook"
                 ),
                 "hook-name": "YellowDog",
                 # Read by Airflow 3.2+ (older versions use the hook's methods)
                 "conn-fields": {
-                    "portal_url": {
-                        "label": "Portal URL",
-                        "description": (
-                            "Optional. Base URL of the YellowDog Portal, used for "
-                            "task links. Default: the Platform API URL with a "
-                            "leading 'api.' replaced by 'portal.'."
-                        ),
+                    ui.PORTAL_URL_FIELD: {
+                        "label": ui.PORTAL_URL_NAME,
+                        "description": ui.PORTAL_URL_DESCRIPTION,
                         "schema": {"type": ["string", "null"]},
                     },
                 },
-                "ui-field-behaviour": {
-                    "hidden-fields": ["schema", "port"],
-                    "relabeling": {
-                        "host": "Platform API URL",
-                        "login": "Application Key ID",
-                        "password": "Application Key Secret",
-                    },
-                    "placeholders": {"host": "https://api.yellowdog.ai"},
-                },
+                "ui-field-behaviour": ui.ui_field_behaviour(provider_info=True),
             },
         ],
         "extra-links": [

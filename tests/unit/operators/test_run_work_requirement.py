@@ -27,6 +27,7 @@ from yellowdog_provider.hooks.yellowdog_hooks import SubmitResult, YellowDogHook
 from yellowdog_provider.operators import yellowdog_operators as ops
 from yellowdog_provider.operators.yellowdog_operators import RunWorkRequirement
 from yellowdog_provider.triggers.yellowdog_triggers import YellowDogStateTrigger
+from yellowdog_provider.utils import airflow_compat
 from yellowdog_provider.utils.airflow_compat import TaskDeferred
 from yellowdog_provider.utils.run_stamp import RunStamp, try_name
 
@@ -112,7 +113,9 @@ def test_run_rejects_empty_targets() -> None:
 
 @pytest.mark.parametrize("configured", [True, False])
 def test_run_deferrable_defaults_to_airflow_setting(configured: bool) -> None:
-    with patch.object(ops.conf, "getboolean", return_value=configured) as get:
+    with patch.object(
+        airflow_compat.conf, "getboolean", return_value=configured
+    ) as get:
         op = RunWorkRequirement(
             task_id="run", work_requirement=_wr(), task_groups_and_tasks=_groups()
         )

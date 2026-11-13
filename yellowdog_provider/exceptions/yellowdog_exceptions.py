@@ -31,8 +31,9 @@ class YellowDogArgumentError(YellowDogException, ValueError):
 
 class YellowDogStateError(YellowDogException, _AirflowFailBase):
     """
-    A sensor found its resource in one of its failure states (by default, a
-    final state that is not a target).
+    A sensor, or an operator that waits (such as ``RunWorkRequirement`` or
+    ``ProvisionWorkerPool``), found its resource in one of its failure states
+    (by default, a final state that is not a target).
 
     It is also Airflow's ``AirflowFailException`` (at runtime, the class that the
     installed Airflow version's task runner and sensors catch), so Airflow fails
@@ -42,7 +43,7 @@ class YellowDogStateError(YellowDogException, _AirflowFailBase):
     :param kind: the kind of resource, e.g. ``"work requirement"``
     :param resource_id: the resource's ID
     :param current_state: the state the resource is in
-    :param target_states: the states the sensor was waiting for
+    :param target_states: the states being waited for
     :param namespace: the resource's namespace, if known
     :param name: the resource's name, if known
     """

@@ -53,7 +53,8 @@ def test_provider_info_lists_extra_links():
 def test_provider_info_declares_portal_url_field():
     conn = get_provider_info()["connection-types"][0]
     assert "portal_url" in conn["conn-fields"]
-    assert (
-        conn["ui-field-behaviour"]["relabeling"]
-        == (YellowDogHook.get_ui_field_behaviour()["relabeling"])
-    )
+    hook = YellowDogHook.get_ui_field_behaviour()
+    info = conn["ui-field-behaviour"]
+    assert info["hidden-fields"] == hook["hidden_fields"]
+    assert info["relabeling"] == hook["relabeling"]
+    assert info["placeholders"] == hook["placeholders"]

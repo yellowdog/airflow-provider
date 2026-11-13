@@ -11,11 +11,11 @@ Test the YellowDog Provider.
 
 # The YellowDog Application credentials to use, contained in an Airflow
 # Connection.
-CONNECTION_ID = "prod-yellowdog-yd-demo"  # Param: connection_id
+CONNECTION_ID = "yellowdog_default"  # Param: connection_id
 
 # The compute requirement template and image family to use for the worker pool.
 # Must match items in the selected YellowDog account.
-CRT_NAME_OR_ID = "yd-demo/yd-demo-aws-gcp-azure-oci-split-ondemand"
+CRT_NAME_OR_ID = "my-namespace/my-compute-requirement-template"
 IMAGE_FAMILY_NAME_OR_ID = "yellowdog/yd-agent-docker"
 
 # Optional userdata script for the worker pool's instances (empty means none).
@@ -61,7 +61,6 @@ DAG_ID = "yellowdog-provider-test"
 
 import math
 from datetime import timedelta
-from re import sub
 from typing import Any, cast
 
 from airflow.sdk import (
@@ -94,6 +93,7 @@ from yellowdog_provider.operators.yellowdog_operators import (
     RunWorkRequirement,
     ShutdownProvisionedWorkerPool,
 )
+from yellowdog_provider.utils.run_stamp import MAX_NAME_LENGTH, sanitise_name
 
 ###############################################################################
 # Define the DAG
@@ -180,7 +180,7 @@ def yd_provider_test():
 
 ###############################################################################
 # Object generator functions; these are used as Callable arguments for the
-# YellowDog operator and sensor classes
+# YellowDog operators
 
 
 def gen_namespace(context: Context, jinja_env: Environment) -> str:
@@ -366,27 +366,7 @@ def _get_entity_name(context: Context, prefix: str) -> str:
     assert task_instance is not None
     # Drop "manual__" before normalising, so the result is still valid
     run_id = task_instance.run_id.replace("manual__", "")
-    return _normalise_yd_name(f"{prefix}-{run_id}")
-
-
-def _normalise_yd_name(name: str) -> str:
-    """
-    Format a string to be consistent with YellowDog naming requirements: at
-    most 60 characters, only lower-case letters, digits, underscore or
-    hyphen, starting with a letter and ending with a letter or digit.
-    """
-    # Make obvious substitutions
-    new_yd_name = name.replace("/", "-").replace(" ", "_").replace(".", "_").lower()
-
-    # Enforce acceptable characters
-    new_yd_name = sub("[^a-z0-9_-]", "", new_yd_name).strip("-_")
-
-    # Must start with a letter
-    if not new_yd_name[:1].isalpha():
-        new_yd_name = "x-" + new_yd_name if new_yd_name else "x"
-
-    # Mustn't exceed 60 chars, nor end with "-" or "_" once shortened
-    return new_yd_name[:60].rstrip("-_")
+    return sanitise_name(f"{prefix}-{run_id}", MAX_NAME_LENGTH)
 
 
 ###############################################################################

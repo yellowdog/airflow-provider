@@ -1,23 +1,21 @@
 """Quickstart: run one task on an existing YellowDog worker pool. Needs the Airflow
 Connection `yellowdog_default` and a running pool whose workers carry `worker_tag`."""
 
-from re import sub
-
 from airflow.sdk import DAG, Context
 from airflow.sdk.definitions.param import ParamsDict
 from jinja2 import Environment
 from yellowdog_client.model import RunSpecification, Task, TaskGroup, WorkRequirement
 
 from yellowdog_provider.operators.yellowdog_operators import RunWorkRequirement
+from yellowdog_provider.utils.run_stamp import MAX_NAME_LENGTH, sanitise_name
 
 
 # Airflow calls these at run time (parameter names must be exactly these).
 def make_work_requirement(context: Context, jinja_env: Environment) -> WorkRequirement:
     assert "params" in context and "run_id" in context
-    # YellowDog names allow only a-z, 0-9, "_" and "-", up to 60 characters,
-    # starting with a letter and ending with a letter or digit.
-    name = sub(r"[^a-z0-9_-]", "-", f"quickstart-{context['run_id']}".lower())
-    name = name[:60].rstrip("-_")
+    # Make a valid YellowDog name: a-z, 0-9, "_" and "-", up to 60 characters,
+    # starting with a letter and ending with a letter or digit
+    name = sanitise_name(f"quickstart-{context['run_id']}", MAX_NAME_LENGTH)
     return WorkRequirement(namespace=context["params"]["namespace"], name=name)
 
 

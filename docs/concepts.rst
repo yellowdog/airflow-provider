@@ -248,8 +248,9 @@ A typical DAG has three tasks (see :doc:`workflow`):
    or ``RUNNING``.
 #. ``RunWorkRequirement`` submits work whose run specification targets that
    worker tag, and waits until it completes.
-#. ``ShutdownProvisionedWorkerPool`` (the teardown) cancels any of the run's
-   work still running and shuts the pool down, whatever happened upstream.
+#. ``ShutdownProvisionedWorkerPool`` (the teardown) cancels any work of its
+   setup/teardown scope still running and shuts the pool down, whatever
+   happened upstream.
 
 The finer-grained operators and the sensors split these steps into more
 tasks; see :doc:`step-by-step`.

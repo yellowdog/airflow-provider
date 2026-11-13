@@ -45,7 +45,8 @@ Connection fields
      - Optional free text, for example the purpose and scope of the
        Application.
 
-The *schema* and *port* fields are not used and are hidden in the UI.
+The *schema* and *port* fields are not used, and the raw JSON *extra* field is
+replaced by the *Portal URL* field; all three are hidden in the UI.
 
 **Platform API URL.** The URL is normalised before use:
 
@@ -63,8 +64,10 @@ a leading ``api.`` host label replaced by ``portal.`` (for example
 ``https://api.yellowdog.ai`` gives ``https://portal.yellowdog.ai``). If the
 Platform API host does not start with ``api.`` and no *Portal URL* is set, no
 link is shown. In Airflow 3.1 the field appears in the UI only where the
-Flask-AppBuilder libraries are installed; elsewhere set it in the connection's
-JSON ``extra`` as ``{"portal_url": "https://..."}``.
+Flask-AppBuilder libraries are installed. Elsewhere, set it outside the UI, in
+the connection's JSON ``extra`` as ``{"portal_url": "https://..."}``: with
+``airflow connections add ... --conn-extra '{"portal_url": "https://..."}'``,
+an ``AIRFLOW_CONN_<ID>`` environment variable in JSON form, or the REST API.
 
 **Portal links.** The *YellowDog work requirement* link appears on
 ``RunWorkRequirement``, ``AddWorkRequirement``, ``AddPopulatedWorkRequirement``

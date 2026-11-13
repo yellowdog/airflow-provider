@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from tests.support import make_context
+from yellowdog_provider.exceptions.yellowdog_exceptions import YellowDogException
 from yellowdog_provider.utils import run_stamp
 from yellowdog_provider.utils.run_stamp import (
     INSTANCE_TAG_PREFIX_PATTERN,
@@ -243,3 +244,23 @@ def test_task_tag_prefix_for_other_task() -> None:
         task_tag_prefix_for(stamp, "other")
         == _stamp(task_id="other", deployment_id="dep").task_tag_prefix()
     )
+
+
+@pytest.mark.parametrize(
+    "raw", ["", "9", "a" * 59 + "-b", "a" * 59 + "_", "x" * 200, "My.DAG " * 20]
+)
+def test_sanitise_name_max_length_is_a_valid_name(raw: str) -> None:
+    assert NAME_PATTERN.fullmatch(sanitise_name(raw, MAX_NAME_LENGTH))
+
+
+def test_sanitise_name_max_length_keeps_long_names_distinct() -> None:
+    a = sanitise_name("x" * 100 + "a", MAX_NAME_LENGTH)
+    b = sanitise_name("x" * 100 + "b", MAX_NAME_LENGTH)
+    assert a != b
+    assert len(a) == len(b) == MAX_NAME_LENGTH
+    assert sanitise_name("short", MAX_NAME_LENGTH) == "short"
+
+
+def test_sanitise_name_rejects_tiny_max_length() -> None:
+    with pytest.raises(YellowDogException, match="max_length"):
+        sanitise_name("abc", 9)

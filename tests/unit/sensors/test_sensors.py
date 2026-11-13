@@ -656,14 +656,14 @@ def test_deferrable_takes_precedence_over_reschedule(
 @cases
 def test_deferrable_default_follows_airflow_config(case: Case) -> None:
     for configured in (True, False):
-        with patch(f"{SENSORS_MODULE}.conf") as conf:
+        with patch("yellowdog_provider.utils.airflow_compat.conf") as conf:
             conf.getboolean.return_value = configured
             op = case.make(**{f"{case.prefix}_id": "obj-1"})
         conf.getboolean.assert_called_once_with(
             "operators", "default_deferrable", fallback=False
         )
         assert op.deferrable is configured
-    with patch(f"{SENSORS_MODULE}.conf") as conf:
+    with patch("yellowdog_provider.utils.airflow_compat.conf") as conf:
         conf.getboolean.return_value = True
         op = case.make(deferrable=False, **{f"{case.prefix}_id": "obj-1"})
     assert op.deferrable is False

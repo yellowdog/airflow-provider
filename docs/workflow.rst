@@ -134,8 +134,8 @@ An example
 
    provision_run_shutdown()
 
-The package's example DAG ``yellowdog_provider/example_dags/yd-provider-test.py``
-has the same shape, with two work requirements running in parallel on the
+The example DAG `yd-provider-test.py <https://github.com/yellowdog/airflow-provider/tree/main/yellowdog_provider/example_dags/yd-provider-test.py>`_, in the
+provider's GitHub repository, has the same shape, with two work requirements running in parallel on the
 pool, and everything driven by DAG params. Its DAG function:
 
 .. literalinclude:: ../yellowdog_provider/example_dags/yd-provider-test.py
@@ -401,9 +401,10 @@ Any other value raises ``YellowDogArgumentError`` when the DAG is parsed.
   each task in the scope (with the map index, inside a mapped task group).
   Work requirements of other DAG runs, or not submitted by the provider, are
   never touched, even if they have similar names.
-- It is best-effort: a failure to look up or cancel is logged, and the
-  shutdown goes ahead. Nothing is cancelled if the pool is rejected (not a
-  provisioned pool).
+- A failure to look up or cancel does not stop the shutdown: it is logged,
+  the shutdown goes ahead, and then the task fails (without waiting), as work
+  may still be running; a retry cancels and shuts down again. Nothing is
+  cancelled if the pool is rejected (not a provisioned pool).
 
 The teardown also tolerates work that is already done: a pool that is already
 shut down (for example by its idle shutdown) and a compute requirement that

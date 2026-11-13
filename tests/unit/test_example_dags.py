@@ -297,12 +297,6 @@ def test_example_dag_names_valid(dag_id: str, run_id: str):
         assert NAME_RE.fullmatch(name), name
 
 
-@pytest.mark.parametrize("raw", ["", "-", "_9", "9", "a" * 59 + "-b", "a" * 59 + "_"])
-def test_normalise_yd_name_valid(raw: str):
-    module = _load(next(p for p in EXAMPLE_DAGS if p.name == "yd-provider-test.py"))
-    assert NAME_RE.fullmatch(module._normalise_yd_name(raw))
-
-
 @pytest.mark.parametrize(
     ("params", "name"),
     [

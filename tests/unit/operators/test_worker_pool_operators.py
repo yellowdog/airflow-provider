@@ -34,6 +34,7 @@ from yellowdog_provider.operators.yellowdog_operators import (
     ShutdownProvisionedWorkerPool,
 )
 from yellowdog_provider.triggers.yellowdog_triggers import YellowDogStateTrigger
+from yellowdog_provider.utils import airflow_compat
 from yellowdog_provider.utils.airflow_compat import TaskDeferred
 from yellowdog_provider.utils.run_stamp import RunStamp
 
@@ -213,7 +214,7 @@ def _exec(op: Any, pushed: dict[str, Any] | None = None) -> Any:
 
 
 def test_provision_defaults() -> None:
-    with patch.object(ops.conf, "getboolean", return_value=False):
+    with patch.object(airflow_compat.conf, "getboolean", return_value=False):
         op = ProvisionWorkerPool(
             task_id="t", compute_requirement_template_usage=_crtu()
         )
@@ -436,7 +437,7 @@ def _cancelled(platform: FakePlatform) -> list[Any]:
 
 
 def test_shutdown_defaults() -> None:
-    with patch.object(ops.conf, "getboolean", return_value=False):
+    with patch.object(airflow_compat.conf, "getboolean", return_value=False):
         op = ShutdownProvisionedWorkerPool(task_id="t", worker_pool_id="wp-1")
     assert (op.wait, op.cancel_work_requirements) == (False, "scope")
     assert (op.poke_interval, op.timeout, op.deferrable) == (30, 3600, False)
@@ -725,25 +726,51 @@ def test_shutdown_rejects_bad_cancel_work_requirements(value: Any) -> None:
         _shutdown(cancel_work_requirements=value)
 
 
-def test_shutdown_cancel_failure_does_not_stop_shutdown(
-    platform: FakePlatform, mock_client: MagicMock
+def test_shutdown_cancel_failure_shuts_down_then_fails(
+    platform: FakePlatform, pool_fake: PoolFake
 ) -> None:
     a = platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
     b = platform.existing("b", STAMP, WorkRequirementStatus.RUNNING)
     platform.work.cancel_work_requirement_by_id.side_effect = RuntimeError("boom")
-    assert _exec(_shutdown(cancel_work_requirements="run")) == "wp-1"
+    with pytest.raises(YellowDogException, match="Failed to cancel 2 of 2") as info:
+        _exec(
+            _shutdown(
+                cancel_work_requirements="run", terminate_immediately=True, wait=True
+            )
+        )
+    assert isinstance(info.value.__cause__, RuntimeError)
     assert sorted(_cancelled(platform)) == sorted([call(a.id, True), call(b.id, True)])
-    mock_client.worker_pool_client.shutdown_worker_pool_by_id.assert_called_once_with(
-        "wp-1"
+    pool_fake.shutdown.assert_called_once_with("wp-1", terminate_immediately=True)
+    pool_fake.pool_state.assert_not_called()  # Fails instead of waiting
+
+
+def test_shutdown_partial_cancel_failure_names_the_failed(
+    platform: FakePlatform, mock_client: MagicMock
+) -> None:
+    a = platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
+    b = platform.existing("b", STAMP, WorkRequirementStatus.RUNNING)
+    platform.work.cancel_work_requirement_by_id.side_effect = lambda wr_id, abort: (
+        _raise(RuntimeError("boom")) if wr_id == b.id else None
     )
+    with pytest.raises(YellowDogException, match="Failed to cancel 1 of 2") as info:
+        _exec(_shutdown(cancel_work_requirements="run"))
+    assert f"IDs: {b.id})" in str(info.value)
+    assert str(a.id) not in str(info.value)
+    mock_client.worker_pool_client.shutdown_worker_pool_by_id.assert_called_once()
 
 
-def test_shutdown_search_failure_does_not_stop_shutdown(
+def test_shutdown_search_failure_shuts_down_then_fails(
     platform: FakePlatform, mock_client: MagicMock
 ) -> None:
     platform.work.get_work_requirements.side_effect = RuntimeError("boom")
-    assert _exec(_shutdown(cancel_work_requirements="run")) == "wp-1"
+    with pytest.raises(YellowDogException, match="Could not look up") as info:
+        _exec(_shutdown(cancel_work_requirements="run"))
+    assert isinstance(info.value.__cause__, RuntimeError)
     mock_client.worker_pool_client.shutdown_worker_pool_by_id.assert_called_once()
+
+
+def _raise(exc: Exception) -> None:
+    raise exc
 
 
 def test_shutdown_configured_pool_cancels_nothing(

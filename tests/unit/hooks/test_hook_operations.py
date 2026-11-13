@@ -137,12 +137,11 @@ class FakePlatform:
             )
             for wr in self.by_id.values()
             if (search.namespaces is None or wr.namespace in search.namespaces)
-            # deliberately loose (prefix) so the hook's exact filter is tested
+            # As the platform (test_tag_search_matching): a case-sensitive
+            # substring match, so the hook's exact filter is still tested
             and (
                 search.tag is None
-                or (
-                    self.tag_search_works and (wr.tag or "").startswith(search.tag[:20])
-                )
+                or (self.tag_search_works and search.tag in (wr.tag or ""))
             )
             and (search.statuses is None or wr.status in search.statuses)
         ]
@@ -298,7 +297,9 @@ def test_submit_new_derives_name_when_empty(platform: FakePlatform) -> None:
 def test_submit_searches_own_stamp_tag(platform: FakePlatform) -> None:
     _submit()
     assert platform.searches[0].namespaces == [NS]
-    assert platform.searches[0].tag == _tag(STAMP, 1)
+    # The stamp tag without the cycle: the platform matches substrings, so
+    # this finds every cycle's attempts
+    assert platform.searches[0].tag == STAMP.tag()
 
 
 def test_submit_name_owned_by_other_run_gets_fresh_copy(
@@ -431,6 +432,31 @@ def test_submit_finds_earlier_cycle_attempt_by_name_when_tag_search_misses(
     assert result.action == "submitted"
     assert result.work_requirement_id != first.work_requirement_id
     _assert_built(platform, result.name, cycle=3)
+
+
+@pytest.mark.parametrize("cycle", [None, 0])
+def test_submit_resumes_unfinished_earlier_cycle_attempt_under_another_name(
+    platform: FakePlatform, cycle: int | None
+) -> None:
+    # A name callable gave another name before the clear: neither the current
+    # cycle's tag search nor the name probes find it, the unfinished search does
+    own = platform.existing(
+        "wr-old-name", STAMP, WorkRequirementStatus.RUNNING, cycle=cycle
+    )
+    result = _submit(name="wr-new-name", try_number=1, cycle=1)
+    assert (result.action, result.work_requirement_id) == ("resumed", own.id)
+    platform.work.add_work_requirement.assert_not_called()
+
+
+def test_add_resumes_unfinished_earlier_cycle_attempt_under_another_name(
+    platform: FakePlatform,
+) -> None:
+    own = platform.existing(
+        "wr-old-name", STAMP, WorkRequirementStatus.RUNNING, cycle=0
+    )
+    result, _ = _add(name="wr-new-name", cycle=1)
+    assert (result.action, result.work_requirement_id) == ("resumed", own.id)
+    platform.work.add_work_requirement.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -698,6 +724,7 @@ def test_find_unfinished_run_work_requirements_filters_by_tag_prefix_and_status(
     assert sorted(ids) == sorted([str(a.id), str(a_legacy.id), str(b.id)])
     search = platform.searches[-1]
     assert search.namespaces == [NS]
+    assert search.tag == STAMP.run_tag_prefix() + ":"  # Narrowed on the platform
     assert search.statuses is not None
     assert set(search.statuses) == {s for s in WorkRequirementStatus if not s.finished}
 
@@ -715,6 +742,21 @@ def test_find_unfinished_run_work_requirements_all_namespaces(
     )
     assert sorted(ids) == sorted([str(here.id), str(elsewhere.id)])
     assert platform.searches[-1].namespaces is None
+
+
+def test_find_unfinished_run_work_requirements_rejects_mid_tag_match(
+    platform: FakePlatform,
+) -> None:
+    # The platform's substring match also returns a tag with the run prefix
+    # in the middle; the hook's exact prefix check drops it
+    platform.existing(
+        "x", None, WorkRequirementStatus.RUNNING, tag=f"mine-{_tag(STAMP, 1)}"
+    )
+    own = platform.existing("a", STAMP, WorkRequirementStatus.RUNNING)
+    ids = YellowDogHook("yd_test").find_unfinished_run_work_requirements(
+        None, STAMP.run_tag_prefix()
+    )
+    assert ids == [own.id]
 
 
 @pytest.mark.parametrize("prefix", ["", "airflow:", "airflow", "airflow:XYZ"])
@@ -898,6 +940,27 @@ def test_shutdown_failure_still_terminates_then_raises(
     mock_client.compute_client.terminate_compute_requirement_by_id.assert_called_once_with(
         "cr-1"
     )
+
+
+@pytest.mark.parametrize("missing_cr", [True, False])
+def test_shutdown_and_terminate_failures_keep_the_shutdown_error(
+    mock_client: MagicMock, missing_cr: bool
+) -> None:
+    pools = mock_client.worker_pool_client
+    pools.get_worker_pool_by_id.return_value = ProvisionedWorkerPool(
+        id="wp-1", computeRequirementId=None if missing_cr else "cr-1"
+    )
+    shutdown_error = InvalidRequestException("Pool is busy")
+    pools.shutdown_worker_pool_by_id.side_effect = shutdown_error
+    terminate = mock_client.compute_client.terminate_compute_requirement_by_id
+    terminate.side_effect = RuntimeError("terminate failed")
+    with pytest.raises(YellowDogException, match="Pool is busy") as info:
+        YellowDogHook("yd_test").shutdown_worker_pool(
+            "wp-1", terminate_immediately=True
+        )
+    assert info.value.__cause__ is shutdown_error
+    if not missing_cr:
+        assert "terminate failed" in str(info.value)
 
 
 @pytest.mark.parametrize(

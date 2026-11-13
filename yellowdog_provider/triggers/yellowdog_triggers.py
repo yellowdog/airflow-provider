@@ -67,6 +67,21 @@ def _validate_states(kind: ResourceKind, field: str, states: Sequence[str]) -> N
             )
 
 
+def _state_values(states: Sequence[str | Enum]) -> tuple[str, ...]:
+    """The status values of ``states`` (enum members or values)."""
+    return tuple(str(s.value) if isinstance(s, Enum) else s for s in states)
+
+
+def event_error_message(event: dict[str, Any]) -> str:
+    """
+    The message of an ``"error"`` trigger event, followed by its
+    ``error_type`` in parentheses when present.
+    """
+    message = str(event.get("message", ""))
+    error_type = event.get("error_type")
+    return message if error_type is None else f"{message} ({error_type})"
+
+
 class YellowDogStateTrigger(BaseTrigger):
     """
     Poll a YellowDog resource's status every ``poke_interval`` seconds, and
@@ -100,10 +115,10 @@ class YellowDogStateTrigger(BaseTrigger):
     :param connection_id: the Airflow connection ID for YellowDog
     :param kind: the kind of resource
     :param resource_id: the resource's YellowDog ID
-    :raises ~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError:
-        if a state is not a status value of the resource's kind
-    :param target_states: the status values to wait for
-    :param failure_states: the status values that end the wait as a failure
+    :param target_states: the statuses to wait for (status enum members or
+        their values)
+    :param failure_states: the statuses that end the wait as a failure
+        (status enum members or their values)
     :param poke_interval: seconds between checks
     :param end_time: the deadline, in seconds since the epoch (wall clock,
         because the trigger may be resumed in another process)
@@ -120,7 +135,8 @@ class YellowDogStateTrigger(BaseTrigger):
         bounds ``on_kill`` by ``[triggerer] on_kill_timeout`` (default 30
         seconds); an action that takes longer is abandoned.
     :raises ~yellowdog_provider.exceptions.yellowdog_exceptions.YellowDogArgumentError:
-        if ``kill_action`` is unknown or does not suit ``kind``
+        if a state is not a status of the resource's kind, or ``kill_action``
+        is unknown or does not suit ``kind``
     """
 
     def __init__(
@@ -129,8 +145,8 @@ class YellowDogStateTrigger(BaseTrigger):
         connection_id: str,
         kind: ResourceKind | str,
         resource_id: str,
-        target_states: Sequence[str],
-        failure_states: Sequence[str],
+        target_states: Sequence[str | Enum],
+        failure_states: Sequence[str | Enum],
         poke_interval: float,
         end_time: float,
         kill_action: KillAction | None = None,
@@ -139,8 +155,8 @@ class YellowDogStateTrigger(BaseTrigger):
         self.connection_id: str = connection_id
         self.kind: ResourceKind = ResourceKind(kind)
         self.resource_id: str = resource_id
-        self.target_states: tuple[str, ...] = tuple(target_states)
-        self.failure_states: tuple[str, ...] = tuple(failure_states)
+        self.target_states: tuple[str, ...] = _state_values(target_states)
+        self.failure_states: tuple[str, ...] = _state_values(failure_states)
         self.poke_interval: float = float(poke_interval)
         self.end_time: float = float(end_time)
         _validate_states(self.kind, "target_states", self.target_states)

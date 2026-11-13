@@ -46,8 +46,9 @@ from yellowdog_provider.sensors.yellowdog_sensors import (
 from yellowdog_provider.triggers.yellowdog_triggers import (
     ResourceKind,
     YellowDogStateTrigger,
+    event_error_message,
 )
-from yellowdog_provider.utils.airflow_compat import conf
+from yellowdog_provider.utils.airflow_compat import default_deferrable
 from yellowdog_provider.utils.run_stamp import RunStamp, task_tag_prefix_for
 from yellowdog_provider.utils.templating import (
     Templated,
@@ -87,6 +88,24 @@ class YellowDogOperator(BaseOperator):
     def get_hook(self) -> YellowDogHook:
         """Return a hook for the (rendered) connection ID."""
         return YellowDogHook(resolve(self.connection_id, "connection_id"))
+
+    def _reached_before_deferring[S: Enum](
+        self,
+        state: S,
+        targets: Collection[S],
+        failures: Collection[S],
+        describe: Callable[[S], Exception],
+    ) -> bool:
+        """
+        The check a deferrable wait makes before deferring: true if ``state``
+        is a target state; raises ``describe(state)`` if it is a failure state.
+        """
+        if state in targets:
+            self.log.info("Reached status '%s'", state.value)
+            return True
+        if state in failures:
+            raise describe(state)
+        return False
 
 
 class _WorkRequirementSubmitter(YellowDogOperator):
@@ -698,11 +717,7 @@ class RunWorkRequirement(_WorkRequirementSubmitter):
         self.failure_states: list[WorkRequirementStatus] = list(failures)
         self.poke_interval: float = float(poke_interval)
         self.timeout: float = float(timeout)
-        self.deferrable: bool = (
-            conf.getboolean("operators", "default_deferrable", fallback=False)
-            if deferrable is None
-            else deferrable
-        )
+        self.deferrable: bool = default_deferrable(deferrable)
 
     def execute(self, context: Context) -> str:
         """
@@ -755,19 +770,21 @@ class RunWorkRequirement(_WorkRequirementSubmitter):
                         resource_id=wr_id,
                     )
                     return wr_id
-                # Deferrable: check once before deferring
-                state = hook.get_work_requirement_state(wr_id)
-                if state in self.target_states:
-                    self.log.info("Reached status '%s'", state.value)
+                if self._reached_before_deferring(
+                    hook.get_work_requirement_state(wr_id),
+                    self.target_states,
+                    self.failure_states,
+                    lambda state: self._state_error(
+                        wr_id, state, wr.namespace, result.name
+                    ),
+                ):
                     return wr_id
-                if state in self.failure_states:
-                    raise self._state_error(wr_id, state, wr.namespace, result.name)
                 trigger = YellowDogStateTrigger(
                     connection_id=resolve(self.connection_id, "connection_id"),
                     kind=ResourceKind.WORK_REQUIREMENT,
                     resource_id=wr_id,
-                    target_states=[cast(str, s.value) for s in self.target_states],
-                    failure_states=[cast(str, s.value) for s in self.failure_states],
+                    target_states=self.target_states,
+                    failure_states=self.failure_states,
                     poke_interval=self.poke_interval,
                     end_time=time.time() + self.timeout,
                     kill_action="cancel_work_requirement",
@@ -815,32 +832,16 @@ class RunWorkRequirement(_WorkRequirementSubmitter):
         wr_id = work_requirement_id or str(event.get("resource_id", ""))
         self._work_requirement_id = wr_id
         status = event.get("status")
-        message = str(event.get("message", ""))
         if status == "target":
-            self.log.info(message)
+            self.log.info(str(event.get("message", "")))
             return wr_id
-        state = self._known_state(event.get("state"))
-        if status == "failure" and state is not None:
+        _, state = _event_state(event)
+        if status == "failure" and isinstance(state, WorkRequirementStatus):
             if not state.finished:
                 self._cancel(wr_id, "unfinished failure state")
             raise self._state_error(wr_id, state, namespace, name)
         self._cancel(wr_id, f"trigger event '{status}'")
-        if status == "timeout" and state is not None:
-            raise WaitTimeoutError(_WORK_REQUIREMENT, wr_id, state, self.timeout)
-        if status == "error":
-            error_type = event.get("error_type")
-            raise YellowDogException(
-                message if error_type is None else f"{message} ({error_type})"
-            )
-        raise YellowDogException(f"Unexpected trigger event: {event}")
-
-    @staticmethod
-    def _known_state(raw: object) -> WorkRequirementStatus | None:
-        """The event's state, or ``None`` if absent or not a known status."""
-        try:
-            return None if raw is None else WorkRequirementStatus(raw)
-        except ValueError:
-            return None
+        raise _event_error(event, self.timeout)
 
     def _state_error(
         self,
@@ -960,6 +961,7 @@ ready.
 """
 
 _EVENT_KINDS: dict[str, tuple[str, type[Enum]]] = {
+    ResourceKind.WORK_REQUIREMENT.value: (_WORK_REQUIREMENT, WorkRequirementStatus),
     ResourceKind.WORKER_POOL.value: (_WORKER_POOL, WorkerPoolStatus),
     ResourceKind.COMPUTE_REQUIREMENT.value: (
         _COMPUTE_REQUIREMENT,
@@ -975,17 +977,10 @@ def _push_id(context: Context, resource_id: str) -> None:
     context["ti"].xcom_push(key=XCOM_KEY, value=resource_id)
 
 
-def _default_deferrable(deferrable: bool | None) -> bool:
-    """``deferrable``, or Airflow's ``[operators] default_deferrable`` if None."""
-    if deferrable is None:
-        return conf.getboolean("operators", "default_deferrable", fallback=False)
-    return deferrable
-
-
 def _event_state(event: dict[str, Any]) -> tuple[str, Enum | None]:
     """
-    The resource kind label and the state of a worker pool or compute
-    requirement trigger event (``None`` if absent or not a known status).
+    The resource kind label and the state of a trigger event (``None`` if
+    absent or not a known status).
     """
     label, status_type = _EVENT_KINDS.get(
         str(event.get("kind")), (_WORKER_POOL, WorkerPoolStatus)
@@ -999,22 +994,18 @@ def _event_state(event: dict[str, Any]) -> tuple[str, Enum | None]:
 
 def _event_error(event: dict[str, Any], timeout: float) -> YellowDogException:
     """
-    The error for a worker pool or compute requirement trigger event that is
-    not a target event: :exc:`.WaitTimeoutError` for a timeout with a known
-    state, otherwise :exc:`.YellowDogException`.
+    The error for a trigger event that is neither a target nor a failure
+    event: :exc:`.WaitTimeoutError` for a timeout with a known state,
+    otherwise :exc:`.YellowDogException`.
     """
     status = event.get("status")
-    message = str(event.get("message", ""))
     label, state = _event_state(event)
     if status == "timeout" and state is not None:
         return WaitTimeoutError(
             label, str(event.get("resource_id", "")), state, timeout
         )
     if status == "error":
-        error_type = event.get("error_type")
-        return YellowDogException(
-            message if error_type is None else f"{message} ({error_type})"
-        )
+        return YellowDogException(event_error_message(event))
     return YellowDogException(f"Unexpected trigger event: {event}")
 
 
@@ -1112,7 +1103,7 @@ class ProvisionWorkerPool(YellowDogOperator):
         self.wait_until_ready: bool = wait_until_ready
         self.poke_interval: float = float(poke_interval)
         self.timeout: float = float(timeout)
-        self.deferrable: bool = _default_deferrable(deferrable)
+        self.deferrable: bool = default_deferrable(deferrable)
         self._worker_pool_id: str | None = None
         self._ready: bool = False  # The pool is handed over: on_kill leaves it
 
@@ -1157,22 +1148,20 @@ class ProvisionWorkerPool(YellowDogOperator):
                     )
                     self._ready = True
                     return pool_id
-                # Deferrable: check once before deferring
-                state = hook.get_worker_pool_state(pool_id)
-                if state in POOL_READY_STATES:
-                    self.log.info("Reached status '%s'", state.value)
+                if self._reached_before_deferring(
+                    hook.get_worker_pool_state(pool_id),
+                    POOL_READY_STATES,
+                    WORKER_POOL_FINAL_STATES,
+                    lambda state: self._state_error(pool_id, state),
+                ):
                     self._ready = True
                     return pool_id
-                if state in WORKER_POOL_FINAL_STATES:
-                    raise self._state_error(pool_id, state)
                 trigger = YellowDogStateTrigger(
                     connection_id=resolve(self.connection_id, "connection_id"),
                     kind=ResourceKind.WORKER_POOL,
                     resource_id=pool_id,
-                    target_states=[cast(str, s.value) for s in POOL_READY_STATES],
-                    failure_states=[
-                        cast(str, s.value) for s in WORKER_POOL_FINAL_STATES
-                    ],
+                    target_states=POOL_READY_STATES,
+                    failure_states=WORKER_POOL_FINAL_STATES,
                     poke_interval=self.poke_interval,
                     end_time=time.time() + self.timeout,
                     kill_action="terminate_worker_pool",
@@ -1305,8 +1294,10 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
     (for example a :class:`RunWorkRequirement` on an existing pool) still
     cancels its own work on failure, timeout or kill, but its work left
     running after a worker crash is only cleaned up with ``"run"``.
-    Cancellation is best-effort: a failure is logged and the shutdown goes
-    ahead.
+    If the lookup or a cancellation fails, the failure is logged and the
+    shutdown goes ahead (including ``terminate_immediately``), then the task
+    fails with a :exc:`.YellowDogException` instead of waiting, as work
+    requirements may still be running; a retry cancels and shuts down again.
 
     **Waiting.** With ``wait``, the operator pushes the pool ID to XCom (key
     ``return_value``), waits until the pool is SHUTDOWN or TERMINATED and,
@@ -1404,7 +1395,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
         self.wait: bool = wait
         self.poke_interval: float = float(poke_interval)
         self.timeout: float = float(timeout)
-        self.deferrable: bool = _default_deferrable(deferrable)
+        self.deferrable: bool = default_deferrable(deferrable)
         self.cancel_work_requirements: CancelWorkRequirements = cancel_work_requirements
 
     def execute(self, context: Context) -> str:
@@ -1439,12 +1430,17 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
                 )
 
             pool_id = cast(str, worker_pool.id)
-            if self.cancel_work_requirements != "none":
-                self._cancel_work_requirements(hook, context)
+            cancel_error = (
+                None
+                if self.cancel_work_requirements == "none"
+                else self._cancel_work_requirements(hook, context)
+            )
 
             cr_id = hook.shutdown_worker_pool(
                 pool_id, terminate_immediately=self.terminate_immediately
             )
+            if cancel_error is not None:
+                raise cancel_error
 
             if not self.wait:
                 return pool_id
@@ -1571,12 +1567,16 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
             for task_id in task_ids
         ]
 
-    def _cancel_work_requirements(self, hook: YellowDogHook, context: Context) -> None:
+    def _cancel_work_requirements(
+        self, hook: YellowDogHook, context: Context
+    ) -> YellowDogException | None:
         """
-        Best-effort cancel (with abort) of this DAG run's unfinished work
-        requirements in every visible namespace, those of the tasks in this
-        teardown's scope or of the whole run (``cancel_work_requirements``):
-        failures are logged, never raised.
+        Cancel (with abort) this DAG run's unfinished work requirements in
+        every visible namespace, those of the tasks in this teardown's scope
+        or of the whole run (``cancel_work_requirements``). Failures are
+        logged and not raised, so that the pool is still shut down; the error
+        to raise afterwards (chained to the first failure) is returned, or
+        ``None`` if there was none.
         """
         mode = self.cancel_work_requirements
         try:
@@ -1593,7 +1593,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
                         "(as_teardown(setups=...))",
                         self.task_id,
                     )
-                    return
+                    return None
                 self.log.info(
                     "Setup/teardown scope: %s", ", ".join(repr(t) for t in task_ids)
                 )
@@ -1601,12 +1601,18 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
             wr_ids = hook.find_unfinished_run_work_requirements(
                 None, stamp.run_tag_prefix(), task_prefixes
             )
-        except Exception:
+        except Exception as exc:
             self.log.exception(
                 "Could not look up this DAG run's unfinished work requirements; "
                 "none cancelled"
             )
-            return
+            error = YellowDogException(
+                "Could not look up this DAG run's unfinished work requirements, "
+                "so none were cancelled and some may still be running; the "
+                "worker pool was still shut down"
+            )
+            error.__cause__ = exc
+            return error
         where = "this DAG run" if mode == "run" else "this teardown's scope"
         if not wr_ids:
             self.log.info(
@@ -1614,7 +1620,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
                 where,
                 mode,
             )
-            return
+            return None
         self.log.warning(
             "Cancelling %d unfinished work requirement(s) of %s "
             "(cancel_work_requirements='%s'), aborting running tasks",
@@ -1622,11 +1628,24 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
             where,
             mode,
         )
+        failed: list[str] = []
+        first_failure: Exception | None = None
         for wr_id in wr_ids:
             try:
                 hook.cancel_work_requirement(wr_id, abort=True)
-            except Exception:
+            except Exception as exc:
                 self.log.exception("Failed to cancel work requirement ID '%s'", wr_id)
+                failed.append(wr_id)
+                first_failure = first_failure or exc
+        if not failed:
+            return None
+        error = YellowDogException(
+            f"Failed to cancel {len(failed)} of {len(wr_ids)} unfinished work "
+            f"requirement(s) of {where} (IDs: {', '.join(failed)}); they may "
+            "still be running. The worker pool was still shut down"
+        )
+        error.__cause__ = first_failure
+        return error
 
     def _wait_sync(
         self,
@@ -1674,7 +1693,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
                 self._defer_wait(
                     ResourceKind.WORKER_POOL,
                     pool_id,
-                    [cast(str, s.value) for s in WORKER_POOL_FINAL_STATES],
+                    WORKER_POOL_FINAL_STATES,
                     end_time,
                     {"worker_pool_id": pool_id, "compute_requirement_id": cr_id},
                 )
@@ -1685,7 +1704,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
                 self._defer_wait(
                     ResourceKind.COMPUTE_REQUIREMENT,
                     cr_id,
-                    [cast(str, s.value) for s in COMPUTE_REQUIREMENT_FINAL_STATES],
+                    COMPUTE_REQUIREMENT_FINAL_STATES,
                     end_time,
                     {"worker_pool_id": pool_id, "compute_requirement_id": None},
                 )
@@ -1696,7 +1715,7 @@ class ShutdownProvisionedWorkerPool(YellowDogOperator):
         self,
         kind: ResourceKind,
         resource_id: str,
-        targets: list[str],
+        targets: Sequence[Enum],
         end_time: float,
         kwargs: dict[str, Any],
     ) -> NoReturn:

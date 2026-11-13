@@ -32,11 +32,12 @@ from yellowdog_provider.links.yellowdog_links import (
 from yellowdog_provider.triggers.yellowdog_triggers import (
     ResourceKind,
     YellowDogStateTrigger,
+    event_error_message,
 )
 from yellowdog_provider.utils.airflow_compat import (
     AirflowSensorTimeout,
     AirflowSkipException,
-    conf,
+    default_deferrable,
 )
 from yellowdog_provider.utils.templating import (
     Templated,
@@ -133,11 +134,7 @@ class YellowDogSensor(BaseSensorOperator):
             poke_interval=poke_interval, **kwargs
         )
         self.connection_id = connection_id
-        self.deferrable: bool = (
-            conf.getboolean("operators", "default_deferrable", fallback=False)
-            if deferrable is None
-            else deferrable
-        )
+        self.deferrable: bool = default_deferrable(deferrable)
         self.xcom_written: bool = False
         self._resolved: tuple[str, str | None, str | None] | None = None
 
@@ -189,8 +186,8 @@ class YellowDogSensor(BaseSensorOperator):
                 connection_id=resolve(self.connection_id, "connection_id"),
                 kind=spec.kind,
                 resource_id=object_id,
-                target_states=[cast(str, s.value) for s in spec.target_states],
-                failure_states=[cast(str, s.value) for s in spec.failure_states],
+                target_states=spec.target_states,
+                failure_states=spec.failure_states,
                 poke_interval=self.poke_interval,
                 end_time=time.time() + timeout,
             ),
@@ -244,11 +241,8 @@ class YellowDogSensor(BaseSensorOperator):
             raise AirflowSkipException(
                 f"Skipping due to never_fail being set to True: {message}"
             )
-        error_type = event.get("error_type")
         if status == "error":
-            raise YellowDogException(
-                message if error_type is None else f"{message} ({error_type})"
-            )
+            raise YellowDogException(event_error_message(event))
         raise YellowDogException(f"Unexpected trigger event status '{status}': {event}")
 
     def check_status(
@@ -301,7 +295,7 @@ class YellowDogSensor(BaseSensorOperator):
 
         self.log.info(
             f"Current status is '{current_state.value}' ... "
-            f"waiting for {self.poke_interval} seconds"
+            f"waiting for {self.poke_interval:g} seconds"
         )
         return False
 

@@ -474,7 +474,24 @@ failing on a duplicate name), and a work requirement with the same name
 submitted by another task or run is left alone. If the task is killed, its
 work requirement is cancelled, aborting running tasks (best effort).
 
-Example: see the :doc:`quickstart`.
+Example (the same arguments as ``RunWorkRequirement``, without the waiting
+ones; a sensor or a later task then follows the work requirement)::
+
+   add_wr = AddPopulatedWorkRequirement(
+       task_id="add-populated-wr",
+       work_requirement=WorkRequirement(namespace="my-namespace", name=""),
+       task_groups_and_tasks=[
+           (
+               TaskGroup(
+                   name="group-1",
+                   runSpecification=RunSpecification(
+                       taskTypes=["docker"], workerTags=["my-worker-tag"]
+                   ),
+               ),
+               [Task(name="task-1", taskType="docker", arguments=["hello-world"])],
+           )
+       ],
+   )
 
 .. _cancel-work-requirement:
 
@@ -669,8 +686,8 @@ ShutdownProvisionedWorkerPool
 Shuts down a provisioned worker pool: no further tasks are given to its
 workers, and tasks already running are allowed to finish. Identify the pool by
 ID or by namespace and name (:ref:`rules <id-or-name>`). Use it as the
-teardown task of :doc:`workflow`. First, by default, it cancels the DAG run's
-unfinished work requirements.
+teardown task of :doc:`workflow`. First, by default, it cancels the unfinished
+work requirements of its setup/teardown scope.
 
 .. list-table::
    :header-rows: 1
@@ -754,8 +771,10 @@ run*, in every namespace the credentials can see:
 
 Any other value raises ``YellowDogArgumentError`` when the DAG is parsed. The
 work requirements are recognised by the run stamp in their tag, so other
-runs' work and work not submitted by the provider are never touched. Failures
-are logged and the shutdown goes ahead. Under ``"scope"``, a task outside
+runs' work and work not submitted by the provider are never touched. If the
+lookup or a cancellation fails, the shutdown still goes ahead, then the task
+fails (without waiting), as work may still be running; a retry tries again.
+Under ``"scope"``, a task outside
 every scope (for example a ``RunWorkRequirement`` on an existing pool) is not
 cleaned up after a worker crash; use ``"run"`` to cover it. See
 :ref:`teardown-cancellation`, and set :ref:`deployment_id <deployment-id>` if

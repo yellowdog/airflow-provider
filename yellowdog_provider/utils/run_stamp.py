@@ -50,14 +50,27 @@ def _digest(*parts: str | int, length: int = _DIGEST_LENGTH) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:length]
 
 
-def sanitise_name(raw: str) -> str:
+def sanitise_name(raw: str, max_length: int | None = None) -> str:
     """
     Lower-case and reduce to ``[a-z0-9_-]``, collapsing other runs to ``-``,
     then make it start with a letter and end with a letter or digit: leading
     and trailing ``-`` and ``_`` are removed, and ``x-`` is put before a
-    result that starts with a digit (``x`` if nothing is left). The result is
-    not shortened.
+    result that starts with a digit (``x`` if nothing is left).
+
+    With ``max_length``, a longer result is cut short and ends with ``-``
+    and an 8-hex hash of ``raw``, so that names differing only beyond the cut
+    stay distinct; ``sanitise_name(raw, MAX_NAME_LENGTH)`` always matches
+    :data:`NAME_PATTERN`. Without it, the result is not shortened.
+
+    :raises .YellowDogException: if ``max_length`` is less than 10
     """
+    if max_length is not None:
+        if max_length < _SHORT_DIGEST_LENGTH + 2:
+            raise YellowDogException(
+                f"'max_length' must be at least {_SHORT_DIGEST_LENGTH + 2}; "
+                f"got {max_length}"
+            )
+        return _shorten(raw, max_length)
     cleaned = re.sub(r"[^a-z0-9_-]+", "-", raw.lower()).strip(_EDGE_CHARS)
     if not cleaned:
         return _NAME_FALLBACK

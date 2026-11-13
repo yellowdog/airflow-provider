@@ -6,7 +6,7 @@ import copy
 import hashlib
 import importlib
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from types import TracebackType
@@ -38,6 +38,15 @@ from yellowdog_provider.exceptions.yellowdog_exceptions import (
     YellowDogArgumentError,
     YellowDogException,
 )
+from yellowdog_provider.hooks._connection_ui import (
+    APP_KEY_ID_NAME,
+    APP_KEY_SECRET_NAME,
+    CONNECTION_TYPE,
+    PLATFORM_API_URL_DEFAULT,
+    PORTAL_URL_FIELD,
+    PORTAL_URL_NAME,
+    ui_field_behaviour,
+)
 from yellowdog_provider.links.yellowdog_links import portal_base_from_api_url
 from yellowdog_provider.utils.run_stamp import (
     INSTANCE_TAG_PREFIX_PATTERN,
@@ -48,13 +57,6 @@ from yellowdog_provider.utils.run_stamp import (
     try_name,
 )
 
-PLATFORM_API_URL = "Platform API URL"
-PLATFORM_API_URL_DEFAULT = "https://api.yellowdog.ai"
-APP_KEY_ID_NAME = "Application Key ID"
-APP_KEY_SECRET_NAME = "Application Key Secret"
-CONNECTION_TYPE = "yellowdog"
-PORTAL_URL_NAME = "Portal URL"
-PORTAL_URL_FIELD = "portal_url"
 CONN_NAME_ATTR = "connection_id"
 DEFAULT_CONN_NAME = "yellowdog_default"
 HOOK_NAME = "YellowDog"
@@ -187,17 +189,7 @@ class YellowDogHook(BaseHook):
         """
         Return custom UI field behaviour for the YellowDog connection type.
         """
-        return {
-            "hidden_fields": ["schema", "port", "extra"],
-            "relabeling": {
-                "host": PLATFORM_API_URL,
-                "login": APP_KEY_ID_NAME,
-                "password": APP_KEY_SECRET_NAME,
-            },
-            "placeholders": {
-                "host": PLATFORM_API_URL_DEFAULT,
-            },
-        }
+        return ui_field_behaviour(provider_info=False)
 
     @classmethod
     def get_connection_form_widgets(cls) -> dict[str, Any]:
@@ -442,10 +434,12 @@ class YellowDogHook(BaseHook):
         This task's earlier attempts are the work requirements in the
         namespace whose tag is ``stamp.tag()`` (no cycle recorded) or
         ``stamp.tag()`` followed by ``:c<digits>`` (any cycle). They are found
-        by a search for the current cycle's tag and by looking up the names
-        earlier tries would have used, in any cycle (the name, and its
-        ``-try<k>`` names for recent ``k`` up to ``try_number``, with any
-        suffixed variants). The most recently created one decides:
+        by a tag search for ``stamp.tag()`` (the platform matches tag
+        substrings, so this finds every cycle's attempts, whatever their
+        names) and, in case the search misses, by looking up the names earlier
+        tries would have used, in any cycle (the name, and its ``-try<k>``
+        names for recent ``k`` up to ``try_number``, with any suffixed
+        variants). The most recently created one decides:
 
         * none: submit under the name;
         * COMPLETED in the current cycle: return it as ``"already_completed"``.
@@ -489,6 +483,78 @@ class YellowDogHook(BaseHook):
                 "The work requirement to submit must not already contain task "
                 "groups; supply them via 'task_groups_and_tasks'"
             )
+        resolved = self._resolve_attempt(
+            work_requirement,
+            stamp=stamp,
+            try_number=try_number,
+            cycle=cycle,
+            is_fully_built=lambda wr_id: self._is_fully_built(
+                wr_id, task_groups_and_tasks
+            ),
+        )
+        if isinstance(resolved, SubmitResult):
+            return resolved
+        name, tag = resolved
+        return self._add_populated(work_requirement, task_groups_and_tasks, name, tag)
+
+    def add_work_requirement(
+        self,
+        work_requirement: WorkRequirement,
+        *,
+        stamp: RunStamp,
+        try_number: int,
+        cycle: int,
+    ) -> SubmitResult:
+        """
+        Add a work requirement (as given, so normally without task groups),
+        safely across retries and clears. It is tagged
+        :func:`attempt_tag` ``(stamp, cycle)`` and named as in
+        :meth:`submit_work_requirement`.
+
+        This task's earlier attempts are found as there. If the most recently
+        created is COMPLETED in the current cycle it is returned as
+        ``"already_completed"``; if it is unfinished (other than CANCELLING),
+        in any cycle, it is returned as ``"resumed"``. Otherwise (none, or
+        failed, cancelled, or completed in an earlier cycle) the work
+        requirement is added under its name or, if that is held by another
+        work requirement, a fresh name as in :meth:`submit_work_requirement`.
+        Unlike that method, nothing is checked about the earlier attempt's
+        task groups, and nothing is cancelled.
+
+        :raises .YellowDogArgumentError: if ``cycle`` is negative
+        """
+        resolved = self._resolve_attempt(
+            work_requirement,
+            stamp=stamp,
+            try_number=try_number,
+            cycle=cycle,
+            is_fully_built=None,
+        )
+        if isinstance(resolved, SubmitResult):
+            return resolved
+        name, tag = resolved
+        _, wr_id = self._add_stamped(
+            work_requirement, name, tag, without_task_groups=False
+        )
+        return SubmitResult(wr_id, name, "submitted")
+
+    def _resolve_attempt(
+        self,
+        work_requirement: WorkRequirement,
+        *,
+        stamp: RunStamp,
+        try_number: int,
+        cycle: int,
+        is_fully_built: Callable[[str], bool] | None,
+    ) -> SubmitResult | tuple[str, str]:
+        """
+        Decide, from this task's earlier attempts, between following one (the
+        :class:`SubmitResult` is returned) and adding a work requirement (its
+        name and tag are returned), as described in
+        :meth:`submit_work_requirement`. With ``is_fully_built``, an unfinished
+        attempt that is not fully built is cancelled (with abort) and replaced;
+        without it, any unfinished attempt is resumed.
+        """
         if cycle < 0:
             raise YellowDogArgumentError(f"'cycle' must not be negative; got {cycle}")
         namespace = work_requirement.namespace
@@ -497,15 +563,11 @@ class YellowDogHook(BaseHook):
         tag = attempt_tag(stamp, cycle)
 
         lookups: _Lookups = {}
-        attempts = self._find_attempts(
-            namespace, name, stamp_tag, tag, try_number, lookups
-        )
+        attempts = self._find_attempts(namespace, name, stamp_tag, try_number, lookups)
         if not attempts:
             if self._lookup(namespace, name, lookups) is None:
                 self.log.info("No earlier attempt found; submitting '%s'", name)
-                return self._add_populated(
-                    work_requirement, task_groups_and_tasks, name, tag
-                )
+                return name, tag
             self.log.info(
                 "Work requirement '%s/%s' exists but was not submitted by this "
                 "task; submitting a fresh copy",
@@ -545,7 +607,7 @@ class YellowDogHook(BaseHook):
                 and not status.finished
                 and status != WorkRequirementStatus.CANCELLING
             ):
-                if self._is_fully_built(latest.id, task_groups_and_tasks):
+                if is_fully_built is None or is_fully_built(latest.id):
                     self.log.info("Resuming work requirement ID '%s'", latest.id)
                     return SubmitResult(latest.id, latest.name, "resumed")
                 self.log.warning(
@@ -555,73 +617,7 @@ class YellowDogHook(BaseHook):
 
         fresh = self._fresh_name(namespace, name, try_number, stamp_tag, lookups)
         self.log.info("Submitting a fresh copy as '%s'", fresh)
-        return self._add_populated(work_requirement, task_groups_and_tasks, fresh, tag)
-
-    def add_work_requirement(
-        self,
-        work_requirement: WorkRequirement,
-        *,
-        stamp: RunStamp,
-        try_number: int,
-        cycle: int,
-    ) -> SubmitResult:
-        """
-        Add a work requirement (as given, so normally without task groups),
-        safely across retries and clears. It is tagged
-        :func:`attempt_tag` ``(stamp, cycle)`` and named as in
-        :meth:`submit_work_requirement`.
-
-        This task's earlier attempts are found as there. If the most recently
-        created is COMPLETED in the current cycle it is returned as
-        ``"already_completed"``; if it is unfinished (other than CANCELLING),
-        in any cycle, it is returned as ``"resumed"``. Otherwise (none, or
-        failed, cancelled, or completed in an earlier cycle) the work
-        requirement is added under its name or, if that is held by another
-        work requirement, a fresh name as in :meth:`submit_work_requirement`.
-        Unlike that method, nothing is checked about the earlier attempt's
-        task groups, and nothing is cancelled.
-
-        :raises .YellowDogArgumentError: if ``cycle`` is negative
-        """
-        if cycle < 0:
-            raise YellowDogArgumentError(f"'cycle' must not be negative; got {cycle}")
-        namespace = work_requirement.namespace
-        name = work_requirement.name or derive_name(stamp)
-        stamp_tag = stamp.tag()
-        tag = attempt_tag(stamp, cycle)
-        lookups: _Lookups = {}
-        attempts = self._find_attempts(
-            namespace, name, stamp_tag, tag, try_number, lookups
-        )
-        if attempts:
-            latest = max(attempts, key=_Attempt.sort_key)
-            status = latest.status
-            if status == WorkRequirementStatus.COMPLETED:
-                if latest.cycle == cycle:
-                    return SubmitResult(latest.id, latest.name, "already_completed")
-            elif (
-                status is not None
-                and not status.finished
-                and status != WorkRequirementStatus.CANCELLING
-            ):
-                self.log.info("Reusing work requirement ID '%s'", latest.id)
-                return SubmitResult(latest.id, latest.name, "resumed")
-            use = self._fresh_name(namespace, name, try_number, stamp_tag, lookups)
-        elif self._lookup(namespace, name, lookups) is None:
-            use = name
-        else:
-            use = self._fresh_name(namespace, name, try_number, stamp_tag, lookups)
-
-        wr = copy.deepcopy(work_requirement)
-        if wr.tag and wr.tag != tag:
-            self.log.warning("Replacing tag '%s' with the run stamp '%s'", wr.tag, tag)
-        wr.name = use
-        wr.tag = tag
-        self.log.info("Adding work requirement '%s/%s'", namespace, use)
-        added = self.get_conn().work_client.add_work_requirement(wr)
-        wr_id = _require(added.id, "work requirement ID")
-        self.log.info("Added work requirement ID '%s'", wr_id)
-        return SubmitResult(wr_id, use, "submitted")
+        return fresh, tag
 
     def find_unfinished_run_work_requirements(
         self,
@@ -678,8 +674,14 @@ class YellowDogHook(BaseHook):
                 return []
             starts = tuple(p + ":" for p in task_tag_prefixes)
             exact = frozenset(task_tag_prefixes)
+        # The platform's tag filter matches substrings (case-sensitively), so
+        # it narrows the search to this run's work requirements (and, in
+        # principle, ones with the run prefix mid-tag); prefixes are matched
+        # exactly below. Verified by tests/system/test_components.py
+        # ::test_tag_search_matching
         search = WorkRequirementSearch(
             namespaces=None if namespace is None else [namespace],
+            tag=run_tag_prefix + ":",
             statuses=list(_UNFINISHED_WORK_REQUIREMENT_STATUSES),
         )
         summaries = self.get_conn().work_client.get_work_requirements(search)
@@ -700,19 +702,22 @@ class YellowDogHook(BaseHook):
         namespace: str,
         name: str,
         stamp_tag: str,
-        tag: str,
         try_number: int,
         lookups: _Lookups,
     ) -> list[_Attempt]:
         """
         This task's earlier work requirements (tags owned per
-        :func:`_owned_cycle`), from a search for the current cycle's ``tag``
-        and from the names earlier tries (of any cycle) would have used.
+        :func:`_owned_cycle`), from a search for ``stamp_tag`` (every cycle,
+        whatever the names) and from the names earlier tries (of any cycle)
+        would have used.
         """
         work = self.get_conn().work_client
         attempts: dict[str, _Attempt] = {}
-        # The tag filter narrows the search; ownership is checked here
-        search = WorkRequirementSearch(namespaces=[namespace], tag=tag)
+        # The platform's tag filter matches substrings (see
+        # find_unfinished_run_work_requirements), so this finds the attempts
+        # of every cycle, whatever their names (a name callable may give
+        # another name after a clear). Ownership is checked here.
+        search = WorkRequirementSearch(namespaces=[namespace], tag=stamp_tag)
         for summary in work.get_work_requirements(search).list_all():
             owned, cycle = _owned_cycle(summary.tag, stamp_tag)
             if owned and summary.id is not None:
@@ -835,6 +840,32 @@ class YellowDogHook(BaseHook):
                 break
         return count
 
+    def _add_stamped(
+        self,
+        work_requirement: WorkRequirement,
+        name: str,
+        tag: str,
+        *,
+        without_task_groups: bool,
+    ) -> tuple[WorkRequirement, str]:
+        """
+        Add a copy of the work requirement named ``name`` and tagged ``tag``
+        (replacing any tag, with a warning), optionally without its task
+        groups; return the added work requirement and its ID.
+        """
+        wr = copy.deepcopy(work_requirement)
+        if wr.tag and wr.tag != tag:
+            self.log.warning("Replacing tag '%s' with the run stamp '%s'", wr.tag, tag)
+        wr.name = name
+        wr.tag = tag
+        if without_task_groups:
+            wr.taskGroups = None
+        self.log.info("Adding work requirement '%s/%s'", wr.namespace, name)
+        added = self.get_conn().work_client.add_work_requirement(wr)
+        wr_id = _require(added.id, "work requirement ID")
+        self.log.info("Added work requirement ID '%s'", wr_id)
+        return added, wr_id
+
     def _add_populated(
         self,
         work_requirement: WorkRequirement,
@@ -844,17 +875,9 @@ class YellowDogHook(BaseHook):
     ) -> SubmitResult:
         """Add the work requirement, set its task groups, then add the tasks."""
         work = self.get_conn().work_client
-        wr = copy.deepcopy(work_requirement)
-        if wr.tag and wr.tag != tag:
-            self.log.warning("Replacing tag '%s' with the run stamp '%s'", wr.tag, tag)
-        wr.name = name
-        wr.tag = tag
-        wr.taskGroups = None
-
-        self.log.info("Adding work requirement '%s/%s'", wr.namespace, name)
-        added = work.add_work_requirement(wr)
-        wr_id = _require(added.id, "work requirement ID")
-        self.log.info("Added work requirement ID '%s'", wr_id)
+        added, wr_id = self._add_stamped(
+            work_requirement, name, tag, without_task_groups=True
+        )
 
         try:
             task_groups = [copy.deepcopy(group) for group, _ in task_groups_and_tasks]
@@ -956,7 +979,9 @@ class YellowDogHook(BaseHook):
         already terminating or terminated (the platform rejects the step as
         an "invalid transition"), is logged and tolerated. The two steps are
         independent: if the shutdown fails otherwise, the compute requirement
-        is still terminated, and then the shutdown's error is raised.
+        is still terminated, and then the shutdown's error is raised (if the
+        termination fails too, a :exc:`.YellowDogException` naming both
+        errors is raised, chained to the shutdown's).
 
         :param worker_pool_id: the worker pool's YellowDog ID
         :param terminate_immediately: also terminate the compute requirement
@@ -995,9 +1020,18 @@ class YellowDogHook(BaseHook):
                 )
         if not terminate_immediately:
             return None
-        cr_id = _require(pool.computeRequirementId, "compute requirement ID")
-        self.log.info("Immediately terminating compute requirement ID '%s'", cr_id)
-        self.terminate_compute_requirement(cr_id)
+        try:
+            cr_id = _require(pool.computeRequirementId, "compute requirement ID")
+            self.log.info("Immediately terminating compute requirement ID '%s'", cr_id)
+            self.terminate_compute_requirement(cr_id)
+        except Exception as terminate_error:
+            if shutdown_error is None:
+                raise
+            raise YellowDogException(
+                f"Failed to shut down worker pool ID '{worker_pool_id}' "
+                f"({shutdown_error}), and then to terminate its compute "
+                f"requirement ({terminate_error})"
+            ) from shutdown_error
         if shutdown_error is not None:
             raise shutdown_error
         return cr_id

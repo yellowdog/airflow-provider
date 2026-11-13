@@ -27,7 +27,8 @@ as a setup task, the new ``RunWorkRequirement`` for the work, and
   parallel scopes in one DAG run (for example a CPU pool and a GPU pool,
   each with its own setup and teardown) leave each other's work alone;
   inside a mapped task group, each teardown instance covers only its own map
-  instance of the group's tasks.
+  instance of the group's tasks. If that cancellation fails, the teardown
+  still shuts the pool down, then fails, so the failure is visible.
 
 New: YellowDog Portal links
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -46,6 +47,10 @@ supported (1.0.4 required Airflow 2.10 or later).
 **Python 3.12, 3.13 and 3.14 are supported; Python 3.10 and 3.11 are not.**
 
 **YellowDog SDK 15.10.0 or later is required** (1.0.4 required 15.2.0).
+
+**The hook's** ``conn_name_attr`` **is now** ``connection_id``, matching the
+hook's constructor argument (it was ``yellowdog_conn_id``). This matters only
+to code that reads that attribute.
 
 **Operators and sensors take keyword arguments only.** Positional arguments
 (such as ``task_id`` and ``connection_id``) are no longer accepted.
@@ -273,7 +278,8 @@ terminating or terminated, is treated as success (1.0.4 failed with the
 platform's "invalid transition" error). With ``terminate_immediately=True``,
 the compute requirement is now terminated even if the pool's shutdown fails
 for another reason; the task then fails with the shutdown error (1.0.4 did not
-try to terminate).
+try to terminate), or, if the termination fails too, with an error naming
+both.
 
 **default_deferrable applies to the provider's sensors.** The sensors now
 support deferrable mode, and ``deferrable`` defaults to Airflow's
@@ -294,10 +300,6 @@ set the waiting operators' ``timeout`` and ``poke_interval``; a new
 pool is named ``wp-<dag_id>-<run_id>``. ``yd-quickstart.py`` runs one
 ``RunWorkRequirement`` instead of submitting and then waiting with a sensor.
 DAGs copied from the 1.x examples keep working, but see the entries above.
-
-**Type stub files (.pyi) are no longer shipped.** Annotations are inline and
-the package ships ``py.typed``; it is checked with pyright (strict) and
-``pyright --verifytypes``.
 
 Added
 ~~~~~
@@ -334,7 +336,8 @@ Added
   ``terminate_compute_requirement`` and ``portal_base_url``, with
   :class:`~yellowdog_provider.hooks.yellowdog_hooks.SubmitResult`; and the
   utilities ``yellowdog_provider.utils.run_stamp`` (``RunStamp``,
-  ``derive_name``, ``try_name``) and ``yellowdog_provider.utils.waiting``
+  ``derive_name``, ``try_name``, ``sanitise_name``) and
+  ``yellowdog_provider.utils.waiting``
   (``wait_for_state``, ``resolve_states``, ``is_transient_error``). See
   :doc:`taskflow`.
 * The Airflow setting ``[yellowdog] deployment_id``
@@ -367,8 +370,8 @@ Added
   operators and sensors), so Airflow discovers the provider and its
   connection type.
 * Complete type annotations, validated in CI.
-* Example DAGs: ``yd-quickstart.py`` and a params-driven ``yd-provider-test.py``
-  (connection, namespace, compute requirement template, image family, task
+* Example DAGs, in the GitHub repository: a new ``yd-quickstart.py``, and a
+  reworked, params-driven ``yd-provider-test.py`` (connection, namespace, compute requirement template, image family, task
   type and arguments, timeout, poke interval, ``deferrable``, maximum nodes,
   and an optional ``user_data`` parameter for instance userdata).
 * Restructured documentation: concepts, quick start, the three-task workflow,
@@ -384,8 +387,6 @@ Fixed
   with 1.0.4 groups would be created in reverse order.
 * ``AddTaskGroupsToWorkRequirement`` returns the new task group IDs in the
   same order as the ``task_groups`` argument (previously in platform order).
-* The hook's ``conn_name_attr`` is now ``connection_id``, matching the hook's
-  constructor argument (it was ``yellowdog_conn_id``).
 * Connection host handling: an empty host uses the default Platform API URL;
   a missing scheme gets ``https://``; trailing ``/`` characters are removed.
   A connection without an Application Key ID or Secret gives a clear error.

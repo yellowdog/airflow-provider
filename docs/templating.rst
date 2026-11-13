@@ -144,8 +144,8 @@ This most often happens in a task that runs even though an upstream task
 failed, such as a clean-up task with ``trigger_rule=TriggerRule.ALL_DONE``.
 Airflow *teardown* tasks (``.as_teardown(setups=...)``) are less affected,
 because Airflow does not run a teardown whose setup task failed, so the
-setup's XCom value is there whenever the teardown runs. The package's example
-DAG ``yd-provider-test.py`` therefore passes the pool's ID from XCom to its
+setup's XCom value is there whenever the teardown runs. The example DAG
+``yd-provider-test.py`` (in the provider's GitHub repository) therefore passes the pool's ID from XCom to its
 teardown. Prefer IDs to names: a name built from the run can match another
 resource, and a work requirement's name can differ from the one supplied
 (see :ref:`safe-retries`).

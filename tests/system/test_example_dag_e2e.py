@@ -65,7 +65,6 @@ subprocess environment), never on a command line.
 
 import json
 import os
-import re
 import subprocess
 import time
 from collections.abc import Callable, Iterator
@@ -92,7 +91,7 @@ from tests.system.config import (
     task_arguments_or_skip,
 )
 from tests.system.versions import VersionError, constraints_url, resolve
-from yellowdog_provider.utils.run_stamp import RunStamp
+from yellowdog_provider.utils.run_stamp import MAX_NAME_LENGTH, RunStamp, sanitise_name
 
 pytestmark = pytest.mark.e2e
 
@@ -452,18 +451,9 @@ def _dag_conf(config: SystemTestConfig, **overrides: Any) -> dict[str, Any]:
     }
 
 
-def _normalise_yd_name(name: str) -> str:
-    """As the example DAG's ``_normalise_yd_name``."""
-    name = name.replace("/", "-").replace(" ", "_").replace(".", "_").lower()
-    name = re.sub("[^a-z0-9_-]", "", name).strip("-_")
-    if not name[:1].isalpha():
-        name = "x-" + name if name else "x"
-    return name[:60].rstrip("-_")
-
-
 def _dag_entity_name(prefix: str, run_id: str) -> str:
     """As the example DAG's ``_get_entity_name``."""
-    return _normalise_yd_name(f"{prefix}-{run_id.replace('manual__', '')}")
+    return sanitise_name(f"{prefix}-{run_id.replace('manual__', '')}", MAX_NAME_LENGTH)
 
 
 def dag_pool_name(run_id: str) -> str:

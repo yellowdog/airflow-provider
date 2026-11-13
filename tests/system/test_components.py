@@ -37,6 +37,7 @@ from yellowdog_client.model import (
     TaskGroup,
     WorkerPoolStatus,
     WorkRequirement,
+    WorkRequirementSearch,
     WorkRequirementStatus,
 )
 from yellowdog_client.model.exceptions import InvalidRequestException
@@ -438,6 +439,83 @@ def test_cancel_idempotent(
         )
         _cancel(wr_id)
         _cancel(wr_id)  # Must not raise
+
+
+def _search_ids(
+    client: PlatformClient, tag: str, namespaces: list[str] | None
+) -> set[str]:
+    search = WorkRequirementSearch(
+        namespaces=namespaces,
+        tag=tag,
+        statuses=[s for s in WorkRequirementStatus if not s.finished],
+    )
+    return {
+        s.id
+        for s in client.work_client.get_work_requirements(search).list_all()
+        if s.id is not None
+    }
+
+
+def test_tag_search_matching(
+    yd_client: PlatformClient,
+    system_config: SystemTestConfig,
+    run_tag: str,
+    sweep_run_tag_prefixes: list[str],
+) -> None:
+    """
+    How ``WorkRequirementSearch.tag`` matches, with a run-stamp tag: whole tag,
+    run prefix (``airflow:<run>`` and ``airflow:<run>:``), task prefix, and a
+    substring that is not a prefix. The teardown's search could pass the run
+    prefix to the platform only if prefixes match. Adds one empty work
+    requirement (no task groups, so no compute), then cancels it.
+    """
+    stamp = RunStamp(DAG_ID, f"{run_tag}-tagsearch", "task", -1)
+    sweep_run_tag_prefixes.append(stamp.run_tag_prefix())
+    tag = attempt_tag(stamp, 0)
+    wr = WorkRequirement(
+        namespace=system_config.namespace, name=f"{run_tag}-tagsearch", tag=tag
+    )
+    wr_id = cast(str, yd_client.work_client.add_work_requirement(wr).id)
+    try:
+        # Allow for search indexing delay: wait until the whole tag matches
+        deadline = time.monotonic() + 60
+        while wr_id not in _search_ids(yd_client, tag, [system_config.namespace]):
+            assert time.monotonic() < deadline, "whole-tag search never matched"
+            time.sleep(3)
+        run_prefix = stamp.run_tag_prefix()
+        probes = {
+            "whole tag": tag,
+            "run prefix": run_prefix,
+            "run prefix + ':'": run_prefix + ":",
+            "task prefix": stamp.task_tag_prefix(),
+            "instance prefix (no cycle)": stamp.tag(),
+            "non-prefix substring": tag[len("airflow:") :],
+            "upper-cased whole tag": tag.upper(),
+        }
+        results: dict[str, tuple[bool, bool]] = {
+            label: (
+                wr_id in _search_ids(yd_client, probe, [system_config.namespace]),
+                wr_id in _search_ids(yd_client, probe, None),
+            )
+            for label, probe in probes.items()
+        }
+        report = "\n".join(
+            f"  {label:28} namespace={ns!s:5}  all namespaces={all_ns}"
+            for label, (ns, all_ns) in results.items()
+        )
+        print(f"\nTag search matching for {tag!r}:\n{report}")
+        log.info("Tag search matching:\n%s", report)
+        # The hook relies on these: YellowDogHook._find_attempts searches for
+        # the instance prefix, find_unfinished_run_work_requirements for the
+        # run prefix + ":"
+        for label in ("whole tag", "run prefix + ':'", "instance prefix (no cycle)"):
+            assert results[label] == (True, True), (
+                f"The platform's tag search no longer matches the {label}; the "
+                "hook's tag searches must change"
+            )
+    finally:
+        with suppress(Exception):
+            yd_client.work_client.cancel_work_requirement_by_id(wr_id, True)
 
 
 def test_sensor_fails_on_failure_state(

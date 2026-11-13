@@ -57,4 +57,18 @@ else:
             TaskDeferred,
         )
 
-__all__ = ["AirflowSensorTimeout", "AirflowSkipException", "TaskDeferred", "conf"]
+
+def default_deferrable(deferrable: bool | None) -> bool:
+    """``deferrable``, or Airflow's ``[operators] default_deferrable`` if None."""
+    if deferrable is None:
+        return conf.getboolean("operators", "default_deferrable", fallback=False)
+    return deferrable
+
+
+__all__ = [
+    "AirflowSensorTimeout",
+    "AirflowSkipException",
+    "TaskDeferred",
+    "conf",
+    "default_deferrable",
+]

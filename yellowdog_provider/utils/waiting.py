@@ -161,6 +161,6 @@ def wait_for_state[S: Enum](
             raise WaitTimeoutError(kind, resource_id, state, timeout)
         log.info(
             f"Current status is '{state.value}' ... waiting for "
-            f"{min(poke_interval, remaining)} seconds"
+            f"{min(poke_interval, remaining):g} seconds"
         )
         sleep(min(poke_interval, remaining))
