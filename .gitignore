@@ -151,3 +151,4 @@ tests/system/userdata.sh
 
 # Superpowers working files
 .superpowers/
+docs/superpowers/
