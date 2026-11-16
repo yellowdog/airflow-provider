@@ -1,6 +1,6 @@
 from typing import Any
 
-__version__ = "2.0.0.dev0"
+__version__ = "2.0.0"
 
 
 def get_provider_info() -> dict[str, Any]:
