@@ -7,7 +7,7 @@ triggerer until a target state, a failure state or a deadline is reached.
 import asyncio
 import time
 from collections.abc import AsyncIterator, Sequence
-from enum import Enum, StrEnum
+from enum import Enum
 from typing import Any, Literal, get_args
 
 from airflow.sdk import BaseHook, Connection
@@ -36,12 +36,16 @@ task is killed by a user (see :meth:`YellowDogStateTrigger.on_kill`).
 """
 
 
-class ResourceKind(StrEnum):
+class ResourceKind(str, Enum):
     """The kinds of YellowDog resource a :class:`YellowDogStateTrigger` polls."""
 
     WORK_REQUIREMENT = "work_requirement"
     WORKER_POOL = "worker_pool"
     COMPUTE_REQUIREMENT = "compute_requirement"
+
+    # As StrEnum (Python 3.11+): str() and format() give the value
+    def __str__(self) -> str:
+        return self.value
 
 
 _STATUS_TYPES: dict[ResourceKind, type[Enum]] = {

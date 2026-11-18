@@ -16,7 +16,7 @@ Before you start
 
 You need:
 
-- A working Airflow 3.1+ installation on Python 3.12–3.14 (for a local trial,
+- A working Airflow 3.1+ installation on Python 3.10–3.14 (for a local trial,
   ``airflow standalone`` is enough).
 - A YellowDog **Application** key ID and secret. Create an Application in the
   YellowDog Portal and give it access to the namespace you will use.

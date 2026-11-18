@@ -3,7 +3,7 @@
 import os
 import re
 import secrets
-import tomllib
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +12,11 @@ from typing import Any
 import pytest
 
 from tests.system.versions import is_label
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover
+    import tomli as tomllib
 
 # Anchored to this directory so the tests can run from any working directory
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"

@@ -1,6 +1,6 @@
 """Typed helpers for Airflow templated fields that may hold callables."""
 
-from typing import Protocol
+from typing import Protocol, TypeAlias, TypeVar
 
 from airflow.sdk import Context
 from jinja2 import Environment
@@ -10,21 +10,24 @@ from yellowdog_provider.exceptions.yellowdog_exceptions import (
     YellowDogException,
 )
 
+T = TypeVar("T")
+T_co = TypeVar("T_co", covariant=True)
 
-class TemplateCallable[T](Protocol):
+
+class TemplateCallable(Protocol[T_co]):
     """A callable Airflow invokes at render time to produce a field value.
 
     Airflow calls it as ``value(context=..., jinja_env=...)``, so the parameter
     names must be exactly ``context`` and ``jinja_env``.
     """
 
-    def __call__(self, *, context: Context, jinja_env: Environment) -> T: ...
+    def __call__(self, *, context: Context, jinja_env: Environment) -> T_co: ...
 
 
-type Templated[T] = T | TemplateCallable[T]
+Templated: TypeAlias = T | TemplateCallable[T]
 
 
-def resolve[T](value: Templated[T], field_name: str) -> T:
+def resolve(value: Templated[T], field_name: str) -> T:
     """Return a rendered templated field value, rejecting unrendered callables."""
     if callable(value):
         raise YellowDogException(

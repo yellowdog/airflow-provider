@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Collection, Sequence
 from datetime import timedelta
 from enum import Enum
-from typing import Any, Literal, NoReturn, cast, get_args
+from typing import Any, Literal, NoReturn, TypeVar, cast, get_args
 
 from airflow.sdk import BaseOperator, BaseOperatorLink, Context
 from yellowdog_client.model import (
@@ -62,6 +62,8 @@ from yellowdog_provider.utils.yellowdog_utils import (
     require_id_or_name,
 )
 
+S = TypeVar("S", bound=Enum)
+
 
 class YellowDogOperator(BaseOperator):
     """
@@ -89,7 +91,7 @@ class YellowDogOperator(BaseOperator):
         """Return a hook for the (rendered) connection ID."""
         return YellowDogHook(resolve(self.connection_id, "connection_id"))
 
-    def _reached_before_deferring[S: Enum](
+    def _reached_before_deferring(
         self,
         state: S,
         targets: Collection[S],

@@ -6,6 +6,8 @@
     name = "yellowdog-airflow-provider"
     description = "YellowDog Provider for Apache Airflow."
     classifiers = [
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
         "Programming Language :: Python :: 3.14",
@@ -14,9 +16,9 @@
         "Framework :: Apache Airflow",
         "Framework :: Apache Airflow :: Provider",
     ]
-    requires-python = ">=3.12, <3.15"
+    requires-python = ">=3.10, <3.15"
     dynamic = ["version"]
-    dependencies = ["apache-airflow>=3.1", "yellowdog-sdk>=15.10.0"]
+    dependencies = ["apache-airflow>=3.1", "yellowdog-sdk>=16.1.1"]
     license = "Apache-2.0"
 
 [[project.authors]]
@@ -43,6 +45,7 @@
         "ruff",
         "sphinx",
         "sphinx-rtd-theme",
+        "tomli",  # tomllib fallback on Python 3.10 (bin, system tests)
         "twine",
         "wheel",
     ]
@@ -58,7 +61,7 @@
 
 [tool.ruff]
     line-length = 88
-    target-version = "py312"
+    target-version = "py310"
     extend-exclude = ["dag-test.py"]
 
 [tool.ruff.lint]
@@ -70,7 +73,7 @@
 
 [tool.pyright]
     include = ["yellowdog_provider", "tests", "bin"]
-    pythonVersion = "3.12"
+    pythonVersion = "3.10"
     strict = ["yellowdog_provider", "tests/typecheck"]
     reportUnnecessaryTypeIgnoreComment = "error"
 

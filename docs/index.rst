@@ -45,8 +45,8 @@ Requirements
 ------------
 
 - Apache Airflow **3.1** or later
-- Python **3.12, 3.13 or 3.14**
-- ``yellowdog-sdk`` **15.10.0** or later (installed automatically)
+- Python **3.10 to 3.14**
+- ``yellowdog-sdk`` **16.1.1** or later (installed automatically)
 - A YellowDog account, and an Application (key ID and secret) with permission
   to use the namespaces your DAGs work in
 

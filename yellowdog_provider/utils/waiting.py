@@ -6,6 +6,7 @@ the operators that wait for a resource to reach a state.
 import time
 from collections.abc import Callable, Sequence
 from enum import Enum
+from typing import TypeVar
 
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import HTTPError, Timeout
@@ -53,9 +54,10 @@ def is_transient_error(exc: BaseException) -> bool:
     return False
 
 
-def _require_states[S: Enum](
-    field_name: str, status_type: type[S], states: Sequence[S]
-) -> None:
+S = TypeVar("S", bound=Enum)
+
+
+def _require_states(field_name: str, status_type: type[S], states: Sequence[S]) -> None:
     for state in states:
         if not isinstance(state, status_type):
             raise YellowDogArgumentError(
@@ -64,7 +66,7 @@ def _require_states[S: Enum](
             )
 
 
-def resolve_states[S: Enum](
+def resolve_states(
     target_states: Sequence[S],
     failure_states: Sequence[S] | None,
     final_states: Sequence[S],
@@ -99,7 +101,7 @@ def resolve_states[S: Enum](
     return targets, tuple(failure_states)
 
 
-def wait_for_state[S: Enum](
+def wait_for_state(
     get_state: Callable[[], S],
     targets: Sequence[S],
     failures: Sequence[S],

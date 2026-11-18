@@ -4,6 +4,13 @@ Changelog
 2.0.1 (unreleased)
 ------------------
 
+**Python 3.10 and 3.11 are supported again.** YellowDog SDK 16.1.1 no longer
+requires ``urllib3<2`` on Python 3.10 and 3.11, which conflicted with Airflow's
+constraints files, so the provider now supports Python 3.10 to 3.14. (The
+latest Airflow releases may need Python 3.11 or later.)
+
+**YellowDog SDK 16.1.1 or later is required** (2.0.0 required 15.10.0).
+
 2.0.0 (2026-11-16)
 ------------------
 

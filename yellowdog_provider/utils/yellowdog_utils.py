@@ -3,7 +3,7 @@ YellowDog utility functions.
 """
 
 from collections.abc import Callable
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from yellowdog_client import PlatformClient
 from yellowdog_client.model import (
@@ -43,7 +43,10 @@ def require_id_or_name(
     )
 
 
-def _get_by_id_or_name[T: (WorkRequirement, WorkerPool, ComputeRequirement)](
+T = TypeVar("T", WorkRequirement, WorkerPool, ComputeRequirement)
+
+
+def _get_by_id_or_name(
     kind: str,
     log: SupportsLog,
     id_field: str,

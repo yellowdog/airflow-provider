@@ -18,7 +18,7 @@ The main documentation is found at: https://docs.yellowdog.ai/airflow-provider/i
 
 ## Requirements
 
-Requires Apache Airflow 3.1 or later, Python 3.12, 3.13 or 3.14, and the [YellowDog SDK](https://pypi.org/project/yellowdog-sdk) (v15.10.0 or later, installed automatically).
+Requires Apache Airflow 3.1 or later, Python 3.10 to 3.14, and the [YellowDog SDK](https://pypi.org/project/yellowdog-sdk) (v16.1.1 or later, installed automatically).
 
 Upgrading from 1.x? See the [changelog and migration guide](docs/changelog.rst).
 
@@ -49,7 +49,7 @@ Useful targets:
 - `make test` — unit tests only (`tests/unit`, `tests/release`)
 - `make docs` — build the Sphinx docs (warnings are errors)
 
-CI (GitHub Actions) runs the unit tests on the minimum supported Airflow (the `apache-airflow` floor in `pyproject.toml`, with the `yellowdog-sdk` floor) with Python 3.12 and 3.13, and on the latest Airflow with Python 3.12 and 3.14. It type-checks at both ends too: the minimum Airflow (with the `yellowdog-sdk` floor) on Python 3.12 and the latest Airflow on Python 3.14. Lint, the docs build and the package build run once, on Python 3.14. [bin/airflow_versions.py](bin/airflow_versions.py) is the single source for these versions (`python bin/airflow_versions.py min|max|sdk-min`).
+CI (GitHub Actions) runs the unit tests on the minimum supported Airflow (the `apache-airflow` floor in `pyproject.toml`, with the `yellowdog-sdk` floor) with Python 3.10 and 3.13, and on the latest Airflow with Python 3.11 and 3.14. It type-checks at both ends too: the minimum Airflow (with the `yellowdog-sdk` floor) on Python 3.10 and the latest Airflow on Python 3.14. Lint, the docs build and the package build run once, on Python 3.14. [bin/airflow_versions.py](bin/airflow_versions.py) is the single source for these versions (`python bin/airflow_versions.py min|max|sdk-min`).
 
 ### System tests (live YellowDog platform)
 

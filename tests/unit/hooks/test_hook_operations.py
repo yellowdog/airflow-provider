@@ -2,7 +2,7 @@
 
 import copy
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -46,7 +46,7 @@ STAMP = RunStamp("dag", "run-1", "task", -1)
 OTHER = RunStamp("dag", "run-0", "task", -1)
 MAPPED_1 = RunStamp("dag", "run-1", "task", 1)
 MAPPED_12 = RunStamp("dag", "run-1", "task", 12)
-T0 = datetime(2026, 1, 1, tzinfo=UTC)
+T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 def _tag(stamp: RunStamp, cycle: int) -> str:

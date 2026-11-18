@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The lowest and highest supported Apache Airflow versions (stdlib only).
+"""The lowest and highest supported Apache Airflow versions (stdlib only;
+``tomli`` on Python 3.10).
 
 Single source of truth for CI, the Makefile and the system tests:
 
@@ -15,9 +16,14 @@ import functools
 import json
 import re
 import sys
-import tomllib
 import urllib.request
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover
+    import tomli as tomllib
+
 
 ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = ROOT / "pyproject.toml"

@@ -36,7 +36,7 @@ jobs:
         # Type-check at both ends of the supported range, installed as in the
         # test job (min also pins the yellowdog-sdk floor).
         include:
-          - { python: "3.12", airflow: "min" }
+          - { python: "3.10", airflow: "min" }
           - { python: "3.14", airflow: "max" }
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +50,8 @@ jobs:
         env:
           LABEL: ${{ matrix.airflow }}
         run: |
+          # bin/airflow_versions.py needs tomli on Python 3.10
+          uv pip install tomli
           V=$(python bin/airflow_versions.py "${LABEL}")
           echo "version=${V}" >> "$GITHUB_OUTPUT"
           if [ "${LABEL}" = "min" ]; then
@@ -77,9 +79,10 @@ jobs:
         # min/max are resolved by bin/airflow_versions.py: min is the
         # apache-airflow floor in pyproject.toml, max the latest on PyPI.
         include:
-          - { python: "3.12", airflow: "min" }
+          # The latest Airflow may not support Python 3.10.
+          - { python: "3.10", airflow: "min" }
           - { python: "3.13", airflow: "min" }
-          - { python: "3.12", airflow: "max" }
+          - { python: "3.11", airflow: "max" }
           - { python: "3.14", airflow: "max" }
     steps:
       - uses: actions/checkout@v4
@@ -93,6 +96,8 @@ jobs:
         env:
           LABEL: ${{ matrix.airflow }}
         run: |
+          # bin/airflow_versions.py needs tomli on Python 3.10
+          uv pip install tomli
           V=$(python bin/airflow_versions.py "${LABEL}")
           echo "version=${V}" >> "$GITHUB_OUTPUT"
           SDK_TEXT="latest allowed by the constraints"
