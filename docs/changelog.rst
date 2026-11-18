@@ -1,7 +1,7 @@
 Changelog
 =========
 
-2.0.1 (unreleased)
+2.0.1 (2026-11-18)
 ------------------
 
 **Python 3.10 and 3.11 are supported again.** YellowDog SDK 16.1.1 no longer
