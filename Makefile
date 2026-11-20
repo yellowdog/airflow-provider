@@ -28,10 +28,10 @@ clean:
 	rm -rf docs/_build
 
 install: build
-	pip install -U -e '.[dev]'
+	uv pip install --upgrade -e '.[dev]'
 
 uninstall:
-	pip uninstall -y yellowdog-airflow-provider
+	uv pip uninstall yellowdog-airflow-provider
 
 format:
 	ruff format . && ruff check --fix .
@@ -48,7 +48,7 @@ typecheck:
 check: lint typecheck test docs
 
 update:
-	pip install -U -e '.[dev]'
+	uv pip install --upgrade -e '.[dev]'
 
 docs:
 	sphinx-build -E -W --keep-going -b html docs docs/_build/html
