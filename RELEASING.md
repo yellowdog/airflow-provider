@@ -35,6 +35,9 @@ You need:
 - `main` has nothing that is not on `next-version`, so `main` can be
   fast-forwarded.
 
+Optionally, `make docs-linkcheck` checks the documentation's external links
+over the network; its report is in `docs/_build/linkcheck/output.txt`.
+
 ## Releasing
 
 1. Optionally, rehearse without changing anything:

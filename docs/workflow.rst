@@ -134,7 +134,7 @@ An example
 
    provision_run_shutdown()
 
-The example DAG `yd-provider-test.py <https://github.com/yellowdog/airflow-provider/tree/main/yellowdog_provider/example_dags/yd-provider-test.py>`_, in the
+The example DAG :repo:`yd-provider-test.py <yellowdog_provider/example_dags/yd-provider-test.py>`, in the
 provider's GitHub repository, has the same shape, with two work requirements running in parallel on the
 pool, and everything driven by DAG params. Its DAG function:
 

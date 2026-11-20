@@ -107,11 +107,11 @@ to URL-encode the secret:
 
 .. code-block:: bash
 
-   $ export AIRFLOW_CONN_YELLOWDOG_DEFAULT='{
-       "conn_type": "yellowdog",
-       "login": "<KEY_ID>",
-       "password": "<KEY_SECRET>"
-     }'
+   export AIRFLOW_CONN_YELLOWDOG_DEFAULT='{
+     "conn_type": "yellowdog",
+     "login": "<KEY_ID>",
+     "password": "<KEY_SECRET>"
+   }'
 
 The URI form also works; because of the host normalisation above, the host can
 be given without a scheme:

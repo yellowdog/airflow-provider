@@ -100,8 +100,7 @@ key or secret); see :doc:`troubleshooting`.
 
 Save the following as ``yd-quickstart.py`` in your Airflow DAGs folder. (It is
 also in the provider's GitHub repository, as
-`yellowdog_provider/example_dags/yd-quickstart.py
-<https://github.com/yellowdog/airflow-provider/tree/main/yellowdog_provider/example_dags/yd-quickstart.py>`_.)
+:repo:`yellowdog_provider/example_dags/yd-quickstart.py`.)
 
 .. literalinclude:: ../yellowdog_provider/example_dags/yd-quickstart.py
    :language: python
@@ -173,7 +172,7 @@ Next steps
 - :doc:`operators` and :doc:`sensors` describe every class and argument.
 - :doc:`templating` explains callables and XCom-to-ID patterns.
 - The full example DAG in the provider's GitHub repository,
-  `yd-provider-test.py <https://github.com/yellowdog/airflow-provider/tree/main/yellowdog_provider/example_dags/yd-provider-test.py>`_, exercises the
+  :repo:`yd-provider-test.py <yellowdog_provider/example_dags/yd-provider-test.py>`, exercises the
   workflow operators: it provisions its own worker pool (a setup task), runs
   two work requirements on it, and shuts it down (a teardown task). Its behaviour is driven by DAG params (connection ID,
   namespace, compute requirement template, image family, task type and

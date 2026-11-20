@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := no_op
 
 .PHONY: build clean install uninstall format lint test check update docs \
-	docs-build-image docs-publish-image pypi-check-build no_op \
+	docs-linkcheck docs-build-image docs-publish-image pypi-check-build no_op \
 	typecheck system-test e2e-test system-test-cleanup release release-test
 
 BUILD_DIST = build dist yellowdog_airflow_provider.egg-info
@@ -25,7 +25,7 @@ build:
 
 clean:
 	rm -rf $(BUILD_DIST) $(PYCACHE) .ruff_cache .pytest_cache
-	$(MAKE) -C docs clean
+	rm -rf docs/_build
 
 install: build
 	pip install -U -e '.[dev]'
@@ -51,7 +51,13 @@ update:
 	pip install -U -e '.[dev]'
 
 docs:
-	$(MAKE) -C docs html SPHINXOPTS="-W --keep-going"
+	sphinx-build -E -W --keep-going -b html docs docs/_build/html
+
+# Every external link the pages make, checked over the network (by hand before
+# a release, never in CI, which would fail on another site's outage); the
+# report is in docs/_build/linkcheck/output.txt
+docs-linkcheck:
+	sphinx-build -b linkcheck docs docs/_build/linkcheck
 
 docs-build-image: docs
 	cd docs && docker build . -t yellowdogco/airflow-provider-docs:$(VERSION) --platform linux/amd64
@@ -93,5 +99,5 @@ system-test-cleanup:
 
 no_op:
 	# Available targets are: build, clean, install, uninstall, format, lint, test,
-	# check, typecheck, update, docs, docs-build-image, docs-publish-image, pypi-check-build,
+	# check, typecheck, update, docs, docs-linkcheck, docs-build-image, docs-publish-image, pypi-check-build,
 	# system-test, e2e-test, system-test-cleanup, release, release-test

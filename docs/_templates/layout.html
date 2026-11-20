@@ -1,0 +1,27 @@
+{#- The theme's page, with the provider's version under the sidebar's title
+    (the theme shows one only on Read the Docs' own hosting, and a reader
+    checks it against 'pip show yellowdog-airflow-provider'), and on the home
+    page its sections under the menu's Overview (conf.py's _overview_sections()) -#}
+{%- extends "!layout.html" %}
+{%- block sidebartitle %}
+  <a href="{{ pathto(root_doc) }}" class="icon icon-home">
+    {{ project }}
+    {%- if logo_url %}
+      <img src="{{ logo_url }}" class="logo" alt="{{ _('Logo') }}"/>
+    {%- endif %}
+  </a>
+  <div class="version">Version {{ release }}</div>
+  {%- include "searchbox.html" %}
+{%- endblock %}
+{%- block menu %}
+  {%- set menu = toctree(maxdepth=theme_navigation_depth|int,
+                         collapse=theme_collapse_navigation|tobool,
+                         includehidden=theme_includehidden|tobool,
+                         titles_only=theme_titles_only|tobool) %}
+  {%- if overview_sections %}
+    {%- set overview = '<a class="current reference internal" href="#">Overview</a>' %}
+    {{ menu|replace(overview, overview ~ overview_sections) }}
+  {%- else %}
+    {{ menu }}
+  {%- endif %}
+{%- endblock %}

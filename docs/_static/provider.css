@@ -1,0 +1,33 @@
+/* The provider's own additions to the theme shared with the other YellowDog
+   documentation sites (custom.css, kept as theirs) */
+
+/* A table's cells wrap rather than running the table off the page; inline
+   code in a cell keeps its words whole */
+.wy-table-responsive table td,
+.wy-table-responsive table th {
+  white-space: normal;
+}
+
+.rst-content table code.literal {
+  word-break: normal;
+  overflow-wrap: normal;
+  white-space: nowrap !important;
+}
+
+/* Inline code a little smaller than the text around it (custom.css sets it
+   the text's size), and tighter in its box, so that a sentence with several
+   code spans neither crowds nor spreads its lines */
+.rst-content code.literal,
+.rst-content tt.literal {
+  font-size: 85%;
+  padding: 0.1em 0.3em;
+}
+
+/* The version under the sidebar's title (_templates/layout.html), in the
+   title's colour, a little smaller */
+.wy-side-nav-search > div.version {
+  color: var(--yd-grey-900);
+  font-size: 0.875rem;
+  margin-top: -0.4em;
+  margin-bottom: 0.6em;
+}

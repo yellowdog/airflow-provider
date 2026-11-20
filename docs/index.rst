@@ -85,6 +85,7 @@ Check that Airflow has found the provider::
    troubleshooting
    api
    changelog
+   GitHub Repository <https://github.com/yellowdog/airflow-provider>
 
 Indices
 -------

@@ -44,6 +44,7 @@
         "pytest",
         "ruff",
         "sphinx",
+        "sphinx-copybutton",
         "sphinx-rtd-theme",
         "tomli",  # tomllib fallback on Python 3.10 (bin, system tests)
         "twine",

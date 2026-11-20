@@ -1,0 +1,11 @@
+{#- The theme's breadcrumbs, with 'View on GitHub' in place of its 'Edit on
+    GitHub': the page's source at this version (html_context's
+    github_source), which a reader views rather than edits -#}
+{%- extends "!breadcrumbs.html" %}
+{%- block breadcrumbs_aside %}
+  <li class="wy-breadcrumbs-aside">
+    {%- if hasdoc(pagename) %}
+      <a href="{{ github_source }}{{ pagename }}{{ page_source_suffix }}" class="fa fa-github"> View on GitHub</a>
+    {%- endif %}
+  </li>
+{%- endblock %}
